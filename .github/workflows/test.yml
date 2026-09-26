@@ -1,0 +1,37 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: End-to-end acceptance run
+        run: python3 e2e_check.py
+      - name: No token, seed or key may be committed
+        run: |
+          if grep -rInP '(?<![0-9A-Za-z])[0-9a-fA-F]{64}(?![0-9A-Za-z])' \
+               --include='*.py' --include='*.md' --include='*.json' --include='*.yml' . ; then
+            echo "64 hex characters standing alone: if that is a key or a seed it must not be here"
+            exit 1
+          fi
+          if grep -rIn 'RECEIPT_LEDGER_TOKEN[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']' \
+               --include='*.py' --include='*.md' --include='*.yml' . ; then
+            echo "a literal token value is assigned in a tracked file"
+            exit 1
+          fi
