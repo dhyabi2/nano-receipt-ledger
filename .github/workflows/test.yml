@@ -30,7 +30,14 @@ jobs:
             echo "64 hex characters standing alone: if that is a key or a seed it must not be here"
             exit 1
           fi
-          if grep -rIn 'RECEIPT_LEDGER_TOKEN[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']' \
+          # The value must not START with `$`: `RECEIPT_LEDGER_TOKEN="$(python3 -c
+          # 'import secrets;print(secrets.token_urlsafe(32))')"` is the README's own
+          # run command, which GENERATES a fresh token and commits nothing. Without
+          # that exclusion this step failed on the commit that created the
+          # repository, and stayed red for 30 hours: the only CI run this repo ever
+          # had was a false positive on its own documentation. A guard that cries
+          # wolf on the README is a guard whose next real finding nobody reads.
+          if grep -rIn 'RECEIPT_LEDGER_TOKEN[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"'$]' \
                --include='*.py' --include='*.md' --include='*.yml' . ; then
             echo "a literal token value is assigned in a tracked file"
             exit 1
