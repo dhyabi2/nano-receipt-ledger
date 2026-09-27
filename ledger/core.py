@@ -157,6 +157,10 @@ class Ledger:
                     409, "block_already_attached",
                     "receipt %s already carries block %s" % (receipt_id, receipt["block_hash"]))
             for other in self.store.receipts():
+                # A hash has two spellings, upper and lower. BLOCK_HASH_RE
+                # above admits only [0-9A-F]{64} and every stored hash came
+                # through it, so both sides here are already upper case.
+                # spelling-ok: forced upper case by BLOCK_HASH_RE at the door
                 if other["block_hash"] == block_hash:
                     raise LedgerError(
                         409, "block_reused",
