@@ -319,6 +319,34 @@ def _run_checks(base, store_path, server):
           and answer["confirmed"] == expect["confirmed"],
           json.dumps(answer) + json.dumps(expect))
 
+    # 17 - one account, two spellings. A counterparty who hands out the legacy
+    # xrb_ form of their address is paid to the same account, so the block that
+    # paid them has to settle their receipt - and the receipt has to record the
+    # canonical nano_ spelling, because the totals count distinct addresses.
+    seller_xrb = "xrb_" + SELLER.split("_", 1)[1]
+    status, legacy = _create(base, counterparty_address=seller_xrb)
+    paid = add_block(block("0017"), SELLER, legacy["amount_raw"])
+    status2, body2, _ = call(
+        base, "POST", "/v1/receipts/%s/attach-block" % legacy["id"],
+        {"block_hash": paid}, auth())
+    settled = json.loads(body2) if status2 == 200 else {}
+    check("17 a counterparty who gave the legacy xrb_ spelling is still settled",
+          status == 201 and legacy["counterparty_address"] == SELLER
+          and status2 == 200 and settled.get("confirmed") is True,
+          json.dumps([status, status2, body2]))
+
+    # 18 - and it did not loosen: a stranger is refused in either spelling
+    status3, receipt3 = _create(base)
+    other_xrb = "xrb_" + OTHER.split("_", 1)[1]
+    wrong = add_block(block("0018"), other_xrb, receipt3["amount_raw"])
+    status4, body4, _ = call(
+        base, "POST", "/v1/receipts/%s/attach-block" % receipt3["id"],
+        {"block_hash": wrong}, auth())
+    _, detail4, _ = call(base, "GET", "/v1/receipts/%s" % receipt3["id"])
+    check("18 a stranger is still refused in the legacy spelling",
+          status4 == 409 and json.loads(body4)["error"] == "block_mismatch"
+          and json.loads(detail4)["block_hash"] is None, body4)
+
     # 11 - the service never asked the node to do anything but read
     check("11 the node was only ever asked for block_info",
           set(NODE_ACTIONS) == {"block_info"}, sorted(set(NODE_ACTIONS)))

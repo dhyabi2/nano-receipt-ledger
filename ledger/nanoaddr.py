@@ -137,8 +137,15 @@ def decode(address: str) -> bytes:
 def validate(address: str) -> dict:
     """Never raises. Returns a JSON-serialisable verdict.
 
-    {"valid": true,  "address": "<normalised>", "public_key": "<64 hex>", "prefix": "nano_"}
+    {"valid": true,  "address": "<as given, stripped>", "normalised": "<nano_ form>",
+     "public_key": "<64 hex>", "prefix": "nano_"}
     {"valid": false, "reason": "<code>", "message": "<human readable>"}
+
+    `address` is the spelling the caller passed; `normalised` is the canonical
+    `nano_` form of the same account. Store `normalised` and compare
+    `public_key`: this docstring used to describe `address` itself as
+    normalised, and the caller that believed it stored the legacy `xrb_`
+    spelling, which could then never be settled or corrected.
     """
     try:
         public_key = decode(address)

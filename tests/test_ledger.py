@@ -698,6 +698,120 @@ class SecretGuard(unittest.TestCase):
                                  "the guard flagged a line carrying no secret: "
                                  + value + "\n" + result.stdout)
 
+# --------------------------------------------------------------------------
+# One account, two spellings; one amount, two spellings.
+#
+# A Nano account has a modern `nano_` form and a legacy `xrb_` form, and
+# `nanoaddr.validate` accepts both because counterparties still hand out
+# either. A node always answers the `nano_` form. An amount of raw is an
+# integer, and "0500" and "500" are one amount. Comparing either as text
+# refuses a block that paid exactly the right account exactly the right
+# amount - and this ledger has no way back from that, because `supersede`
+# refuses a receipt that carries no block.
+# --------------------------------------------------------------------------
+
+SELLER_XRB = "xrb_11131a3ia3a81w61k4id3i8iw5ri46b3871o4rdji8at5eg3t9izij86w3hz"
+OTHER_XRB = "xrb_1111111111111111111111111111111111111111111111111111hifc8npp"
+
+
+class Spellings(Base):
+    def test_the_two_spellings_carry_the_same_account(self):
+        """The premise of every test below, stated once."""
+        self.assertEqual(SELLER_XRB.split("_", 1)[1], SELLER.split("_", 1)[1])
+        self.assertNotEqual(SELLER_XRB, SELLER)
+
+    def test_a_receipt_records_the_canonical_spelling(self):
+        receipt = self.create(counterparty_address=SELLER_XRB)
+        self.assertEqual(receipt["counterparty_address"], SELLER)
+
+    def test_a_counterparty_who_gave_the_legacy_spelling_is_still_settled(self):
+        """The bug: the block paid this account, and the ledger said it did not."""
+        receipt = self.create(counterparty_address=SELLER_XRB)
+        status, body = self.settle(receipt, destination=SELLER)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["confirmed"])
+
+    def test_a_row_stored_before_canonicalisation_still_settles(self):
+        """A receipt already on disk carries whatever spelling it was given, so
+        the comparison has to identify accounts too - canonicalising new writes
+        alone would leave those rows permanently unsettleable."""
+        receipt = self.create()
+        for row in self.application.ledger.store.receipts():
+            if row["id"] == receipt["id"]:
+                row["counterparty_address"] = SELLER_XRB
+        receipt["counterparty_address"] = SELLER_XRB
+        status, body = self.settle(receipt, destination=SELLER)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["confirmed"])
+
+    def test_one_account_spelled_two_ways_is_one_counterparty(self):
+        """`totals` counted distinct strings. Until the comparison above was
+        fixed an `xrb_` row could never be confirmed, so that was right by
+        accident; fixing it alone would have made one seller count as two."""
+        first = self.create()
+        for row in self.application.ledger.store.receipts():
+            row["counterparty_address"] = SELLER_XRB
+        first["counterparty_address"] = SELLER_XRB
+        self.assertEqual(
+            self.settle(first, block_hash=block("A1B2"), destination=SELLER)[0], 200)
+        second = self.create()
+        self.assertEqual(
+            self.settle(second, block_hash=block("C3D4"), destination=SELLER)[0], 200)
+
+        status, listing = self.call("GET", "/v1/receipts")
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["totals"]["confirmed"], 2)
+        self.assertEqual(listing["totals"]["counterparties"], 1)
+
+    def test_a_padded_amount_from_the_node_is_the_same_amount(self):
+        receipt = self.create()
+        status, body = self.settle(receipt, amount_raw="0" + receipt["amount_raw"])
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["confirmed"])
+
+    # -- and it did not loosen ------------------------------------------
+
+    def test_a_stranger_is_still_refused_in_either_spelling(self):
+        for prefix, paid_to in (("A1B2", OTHER), ("C3D4", OTHER_XRB)):
+            receipt = self.create()
+            with self.assertRaises(LedgerError) as caught:
+                self.settle(receipt, block_hash=block(prefix), destination=paid_to)
+            self.assertEqual(caught.exception.code, "block_mismatch")
+            self.assertIn("destination", caught.exception.detail)
+            self.assertIsNone(
+                self.application.ledger.get(receipt["id"])["block_hash"])
+
+    def test_a_short_payment_is_still_refused_against_a_padded_price(self):
+        """The padded-amount fix must not turn into "any amount will do"."""
+        receipt = self.create()
+        short = str(int(receipt["amount_raw"]) - 1)
+        with self.assertRaises(LedgerError) as caught:
+            self.settle(receipt, amount_raw="0" + short)
+        self.assertEqual(caught.exception.code, "block_mismatch")
+        self.assertIn("amount", caught.exception.detail)
+
+    def test_an_amount_that_is_not_an_integer_is_still_refused(self):
+        """`raw_amount` never raises, so each of these has to refuse rather
+        than escape as a ValueError out of a money comparison."""
+        # "\u00b2" is the one that matters: str.isdigit() is True for it and
+        # int() raises, so the guard cannot be isdigit alone.
+        amounts = ("fifty", "", "-" + str(10 ** 28), "5e28", "  ", "50.0",
+                   "\u00b2", "\u0665" * 29)
+        prefixes = ("A1B2", "C3D4", "E5F6", "0708", "090A", "0B0C", "0D0E", "0F10")
+        for prefix, amount in zip(prefixes, amounts):
+            receipt = self.create()
+            with self.assertRaises(LedgerError) as caught:
+                self.settle(receipt, block_hash=block(prefix), amount_raw=amount)
+            self.assertEqual(caught.exception.code, "block_mismatch", amount)
+            self.assertIn("amount", caught.exception.detail)
+
+    def test_a_block_with_no_destination_is_still_refused(self):
+        receipt = self.create()
+        with self.assertRaises(LedgerError) as caught:
+            self.settle(receipt, destination=None)
+        self.assertEqual(caught.exception.code, "block_mismatch")
+        self.assertIn("destination", caught.exception.detail)
+
 
 if __name__ == "__main__":
     unittest.main()
