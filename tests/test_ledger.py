@@ -9,6 +9,7 @@ import ast
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -812,6 +813,65 @@ class Spellings(Base):
         self.assertEqual(caught.exception.code, "block_mismatch")
         self.assertIn("destination", caught.exception.detail)
 
+
+
+class ReadmeCounts(unittest.TestCase):
+    """The README's advertised test counts, checked against the suites themselves.
+
+    They had drifted: the README offered "34 unit tests" and "21 end-to-end
+    checks" to a reader whose run prints 48 and 23. Nothing was broken by it,
+    but this repository's whole argument is that its claims can be checked
+    rather than believed, and the first two numbers a reader can check were
+    wrong. Counting the suites here instead of restating a number is the same
+    move `guard_script` makes with the workflow: the two cannot drift into
+    disagreeing, because only one of them is written down.
+    """
+
+    def readme(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def advertised(self, pattern):
+        found = re.search(pattern, self.readme())
+        self.assertIsNotNone(
+            found, "the README no longer advertises a count matching %r" % pattern)
+        return int(found.group(1))
+
+    def test_the_readme_unit_test_count_is_the_suite_size(self):
+        # Exactly what the README's own command does: discover -s tests.
+        suite = unittest.defaultTestLoader.discover(os.path.join(ROOT, "tests"))
+        self.assertEqual(
+            self.advertised(r"#\s*(\d+)\s+unit tests"), suite.countTestCases())
+
+    def test_the_readme_end_to_end_count_is_the_number_of_checks(self):
+        """Counted from e2e_check.py's own `check(...)` calls, not from a run.
+
+        The unit suite opens no socket and starts no subprocess, and running the
+        end-to-end script here to count its output would break that. Every
+        `check(...)` in that file sits at module level -- none is inside a loop,
+        which this test also asserts -- so the call sites are the count.
+        """
+        with open(os.path.join(ROOT, "e2e_check.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+
+        calls = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "check"]
+
+        looped = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.For, ast.While, ast.comprehension)):
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+                        and inner.func.id == "check"):
+                    looped += 1
+        self.assertEqual(looped, 0,
+                         "a check() inside a loop means the call sites are no "
+                         "longer the count; count a real run instead")
+
+        self.assertEqual(
+            self.advertised(r"#\s*(\d+)\s+end-to-end checks"), len(calls))
 
 if __name__ == "__main__":
     unittest.main()
