@@ -9,6 +9,8 @@ import ast
 import inspect
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -582,6 +584,119 @@ class OverARealSocket(unittest.TestCase):
         status, body, _ = self.fetch("GET", "/v1/custody")
         self.assertEqual(status, 200)
         self.assertIn("Our own funding account's key", body)
+
+
+GUARD_STEP = "No token, seed or key may be committed"
+WORKFLOW = os.path.join(ROOT, ".github", "workflows", "test.yml")
+
+# Every fixture below joins this to its value at runtime. Spelling the
+# assignment out in one piece would plant a literal in a tracked file, which is
+# exactly what the guard exists to refuse - it would fail on this very file.
+TOKEN_VAR = "RECEIPT_LEDGER_TOKEN"
+
+
+def guard_script():
+    """CI's secret-guard step, lifted out of the workflow rather than restated.
+
+    Reading it from the workflow is the point: the suite then checks the guard
+    CI actually runs, so the two cannot drift into disagreeing about what
+    counts as a committed secret.
+    """
+    with open(WORKFLOW) as fh:
+        lines = fh.read().splitlines()
+
+    start = next((i for i, line in enumerate(lines) if GUARD_STEP in line), None)
+    assert start is not None, "the workflow no longer has a step named %r" % GUARD_STEP
+    run = next((j for j in range(start + 1, len(lines))
+                if lines[j].strip().startswith("run:")), None)
+    assert run is not None, "the %r step has no run: block" % GUARD_STEP
+
+    body, indent = [], None
+    for line in lines[run + 1:]:
+        if not line.strip():
+            body.append("")
+            continue
+        here = len(line) - len(line.lstrip())
+        if indent is None:
+            indent = here
+        if here < indent:
+            break
+        body.append(line[indent:])
+    return "\n".join(body)
+
+
+class SecretGuard(unittest.TestCase):
+    """The secret guard, run here so a false positive costs a local run, not a red main.
+
+    This repository's first CI run ever failed on that step and stayed red for
+    thirty hours. The guard was wrong, not the tree: it flagged the README's own
+    start command, which generates a fresh token and commits nothing. Every
+    audit ran this suite, found it green, and had no reason to look at Actions.
+    So the guard belongs in the suite.
+    """
+
+    def run_guard(self, cwd):
+        return subprocess.run(["bash", "-e", "-c", guard_script()],
+                              cwd=cwd, capture_output=True, text=True)
+
+    def guard_in(self, *files):
+        """Run the guard over a tree containing only the given (name, text) files."""
+        with tempfile.TemporaryDirectory() as d:
+            for name, text in files:
+                with open(os.path.join(d, name), "w") as fh:
+                    fh.write(text + "\n")
+            return self.run_guard(d)
+
+    def test_the_guard_passes_on_the_tracked_tree(self):
+        """What CI checks out is the tracked files, so that is what gets scanned."""
+        try:
+            listed = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT,
+                                    capture_output=True)
+        except FileNotFoundError:
+            self.skipTest("git is not available to enumerate the tracked tree")
+        if listed.returncode != 0:
+            self.skipTest("not a git checkout")
+
+        with tempfile.TemporaryDirectory() as d:
+            for name in listed.stdout.decode().split("\0"):
+                src = os.path.join(ROOT, name)
+                if not name or not os.path.isfile(src):
+                    continue
+                dst = os.path.join(d, name)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(src, dst)
+            result = self.run_guard(d)
+
+        self.assertEqual(result.returncode, 0,
+                         "CI's secret guard rejects this tree:\n"
+                         + result.stdout + result.stderr)
+
+    def test_a_literal_token_is_still_refused(self):
+        for spelling in ('="hunter2secret"',
+                         "='hunter2secret'",
+                         ' = "hunter2secret"',
+                         '="Ab3-xY_9kQ"'):
+            leak = TOKEN_VAR + spelling
+            with self.subTest(spelling=leak):
+                result = self.guard_in(("leak.md", leak))
+                self.assertEqual(result.returncode, 1,
+                                 "the guard let a literal token through: " + leak)
+
+    def test_a_bare_64_hex_secret_is_still_refused(self):
+        result = self.guard_in(("seed.md", "seed: " + "A1" * 32))
+        self.assertEqual(result.returncode, 1,
+                         "the guard let 64 standalone hex characters through")
+
+    def test_a_token_the_reader_generates_is_not_a_literal(self):
+        """The README's start command, and anything else holding no secret itself."""
+        for value in ("\"$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')\"",
+                      '"$MY_TOKEN"',
+                      '""'):
+            with self.subTest(value=value):
+                result = self.guard_in(("run.md", TOKEN_VAR + "=" + value))
+                self.assertEqual(result.returncode, 0,
+                                 "the guard flagged a line carrying no secret: "
+                                 + value + "\n" + result.stdout)
 
 
 if __name__ == "__main__":

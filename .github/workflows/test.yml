@@ -30,7 +30,13 @@ jobs:
             echo "64 hex characters standing alone: if that is a key or a seed it must not be here"
             exit 1
           fi
-          if grep -rIn 'RECEIPT_LEDGER_TOKEN[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']' \
+          # A value opening with $ is a command substitution or another variable,
+          # so the token is produced where the command runs and nothing is committed;
+          # the README's own start command is that shape. Only a literal is a leak.
+          # Deliberately quoted-only: RECEIPT_LEDGER_TOKEN=X unquoted also spells a
+          # Python keyword argument and this file's own placeholder, and a guard that
+          # flags those gets ignored, which is how this step stayed red for 30 hours.
+          if grep -rIn 'RECEIPT_LEDGER_TOKEN[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"'$]' \
                --include='*.py' --include='*.md' --include='*.yml' . ; then
             echo "a literal token value is assigned in a tracked file"
             exit 1
