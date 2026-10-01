@@ -17,6 +17,7 @@ from core import Ledger
 from custody import CUSTODY
 from errors import LedgerError
 from money import format_xno
+from node import NodeError
 from store import Store
 
 RECEIPT_PATH = re.compile(r"\A/v1/receipts/(?P<receipt_id>[A-Za-z0-9_]+)\Z")
@@ -120,7 +121,22 @@ class Application:
         self.ledger.get(params["receipt_id"])
         if self.node is None:
             raise LedgerError(503, "no_node", "no Nano node is configured; nothing was attached")
-        info = self.node.block_info(block_hash) if isinstance(block_hash, str) else {"found": False}
+        # A node that is CONFIGURED BUT DOWN is the same situation as the 503
+        # one line above, and it used to get nothing at all: `NanoNode.rpc`
+        # let the transport error out past `_dispatch`, which answers only
+        # LedgerError, and the caller's connection was closed with no HTTP
+        # response. This is the endpoint an agent calls to prove its XNO
+        # payment settled, so "the node was unreachable, retry" has to be
+        # distinguishable from "your block was refused". Nothing has been
+        # written at this point, so the retry is safe and the message says so.
+        try:
+            info = self.node.block_info(block_hash) if isinstance(block_hash, str) else {"found": False}
+        except NodeError as exc:
+            raise LedgerError(
+                503, "node_unavailable",
+                "the Nano node could not be reached, so this block was not checked and "
+                "nothing was attached; the receipt is unchanged and the request can be "
+                "retried: %s" % exc) from None
         return 200, self.render(self.ledger.attach_block(params["receipt_id"], block_hash, info))
 
     def _supersede(self, params, query, body):
