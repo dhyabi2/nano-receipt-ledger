@@ -11,7 +11,14 @@ import urllib.request
 
 
 class NodeError(Exception):
-    pass
+    """This client could not get an answer out of the node.
+
+    Everything the network can do to a read - refuse the connection, time
+    out, hang up mid-body, answer with an HTML error page a JSON parser
+    chokes on - arrives here under one name, so the caller has one thing to
+    catch. It says the node did not answer, never that a block is bad: the
+    two are different answers and only one of them means "do not retry".
+    """
 
 
 class NanoNode:
@@ -31,8 +38,21 @@ class NanoNode:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        # A node on the far end of a socket fails in ways `normalise` below
+        # cannot describe, and none of them were caught: a refused connection
+        # raised URLError straight through the HTTP layer, which answers only
+        # LedgerError, and the caller's connection was closed with no response
+        # at all. OSError covers the transport (URLError and socket timeouts
+        # are both OSError); ValueError covers a body that is not the JSON we
+        # asked for (JSONDecodeError and UnicodeDecodeError are both
+        # ValueError). Deliberately not `except Exception`: a wrong *action*
+        # still raises NodeError above, loudly, and nothing else here should
+        # be turned into "the node is down".
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError) as exc:
+            raise NodeError("%s did not answer %s: %s" % (self.url, action, exc)) from None
 
     def block_info(self, block_hash):
         return normalise(self.rpc(

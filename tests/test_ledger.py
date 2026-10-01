@@ -520,6 +520,126 @@ class Persistence(unittest.TestCase):
             self.assertNotIn(TOKEN, handle.read())
 
 
+class ANodeThatDoesNotAnswer(unittest.TestCase):
+    """The node is configured and down - the ordinary case, not an exotic one.
+
+    `_attach` already answers 503 `no_node` when no node is configured at all.
+    A node that IS configured and cannot be reached is the same situation for
+    the caller, and it used to get something strictly worse than an error: the
+    transport exception went past `Handler._dispatch`, which catches only
+    LedgerError, and the connection was closed with NO HTTP RESPONSE. An agent
+    proving its XNO payment settled could not tell "the node was down, retry"
+    from "the ledger refused my block", and the server printed a traceback.
+    """
+
+    def test_a_node_that_refuses_the_connection_is_a_503_not_a_dropped_connection(self):
+        import threading
+        application = Application(
+            store=Store(), node=node_module.NanoNode("http://127.0.0.1:1", timeout=2),
+            token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def fetch(method, path, body=None, headers=None):
+                data = json.dumps(body).encode("utf-8") if body is not None else None
+                request = urllib.request.Request(
+                    base + path, data=data, method=method,
+                    headers={"Content-Type": "application/json", **(headers or {})})
+                try:
+                    with urllib.request.urlopen(request, timeout=20) as response:
+                        return response.status, response.read().decode("utf-8")
+                except urllib.error.HTTPError as error:
+                    return error.code, error.read().decode("utf-8")
+
+            status, body = fetch("POST", "/v1/receipts", {
+                "kind": "work_settlement", "counterparty": "arion",
+                "counterparty_address": SELLER, "amount_xno": "0.050000",
+                "reason": "delivered the extraction job",
+            }, {"X-Ledger-Token": TOKEN})
+            self.assertEqual(status, 201, body)
+            receipt = json.loads(body)
+
+            # Before the fix this raised http.client.RemoteDisconnected
+            # ("Remote end closed connection without response") out of fetch:
+            # no status, no body, nothing for a caller to act on.
+            status, body = fetch(
+                "POST", "/v1/receipts/%s/attach-block" % receipt["id"],
+                {"block_hash": block()}, {"X-Ledger-Token": TOKEN})
+            self.assertEqual(status, 503, body)
+            answer = json.loads(body)
+            self.assertEqual(answer["error"], "node_unavailable")
+            # It must say the block was not judged, not that it was bad.
+            self.assertIn("retried", answer["message"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # And nothing was written: the receipt is still pending, so the retry
+        # the message promises is in fact safe.
+        _, pending = application.handle(
+            "GET", "/v1/receipts/%s" % receipt["id"], {}, {}, None)
+        self.assertIsNone(pending["block_hash"])
+        self.assertFalse(pending["confirmed"])
+
+    def test_a_node_that_answers_with_something_that_is_not_json(self):
+        """An HTML error page from a proxy in front of the node is the same
+        answer as no answer: the node did not tell us about the block. This
+        drives the real NanoNode against a real socket, not a stand-in."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class BadGateway(BaseHTTPRequestHandler):
+            def do_POST(self):
+                page = b"<html><body>502 Bad Gateway</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+
+            def log_message(self, *args):
+                pass
+
+        proxy = HTTPServer(("127.0.0.1", 0), BadGateway)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            node = node_module.NanoNode(
+                "http://127.0.0.1:%d" % proxy.server_address[1], timeout=5)
+            with self.assertRaises(node_module.NodeError):
+                node.block_info(block())
+
+            application = Application(store=Store(), node=node, token=TOKEN, clock=Clock())
+            _, receipt = application.handle(
+                "POST", "/v1/receipts", {}, {"X-Ledger-Token": TOKEN}, {
+                    "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+                    "amount_xno": "0.010000", "reason": "why"})
+            with self.assertRaises(LedgerError) as caught:
+                application.handle(
+                    "POST", "/v1/receipts/%s/attach-block" % receipt["id"], {},
+                    {"X-Ledger-Token": TOKEN}, {"block_hash": block()})
+            self.assertEqual(caught.exception.status, 503)
+            self.assertEqual(caught.exception.code, "node_unavailable")
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+
+    def test_a_send_shaped_action_still_raises_loudly(self):
+        """The fix must not turn the repository's own tripwire into a 503.
+
+        `NanoNode.rpc` refuses any action but block_info, and the suite's
+        FakeNode raises if the ledger ever asks for something send-shaped.
+        Those are safety properties, not outages: catching them here would
+        hide exactly what they exist to reveal.
+        """
+        node = node_module.NanoNode("http://127.0.0.1:1", timeout=2)
+        with self.assertRaises(node_module.NodeError) as caught:
+            node.rpc({"action": "send", "wallet": "x"})
+        self.assertIn("only block_info", str(caught.exception))
+        with self.assertRaises(RefusesToSend):
+            FakeNode().rpc({"action": "process", "block": {}})
+
+
 class OverARealSocket(unittest.TestCase):
     """One pass over an actual HTTP socket, because routing is where the
     difference between a handler and a server shows up."""

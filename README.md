@@ -108,7 +108,7 @@ its corrections is less trustworthy than one that shows them.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 50 unit tests
+python3 -m unittest discover -s tests -v   # 53 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 
