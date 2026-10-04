@@ -1,0 +1,51 @@
+{
+  "schema": "nano-receipt-ledger/survey/checked/v1",
+  "checked_at": "2026-10-04",
+  "note": "Outcomes are confirmed | unreachable | not_checkable. Nothing is marked verified on an author's word, and `transfers_confirmed_against_chain` is false on every row until a chain RPC is actually queried.",
+  "results": [
+    {
+      "id": "secret_mars-stacks-bounty-payout",
+      "checked_at": "2026-10-04",
+      "transfers_confirmed_against_chain": false,
+      "evidence": [],
+      "outcome": "not_checkable",
+      "detail": "the row is not published, so nothing is checked - including its evidence: fetching what a withheld row names would be acting on it. Reason: This agent was asked, in the thread on 2026-10-04, whether they wanted to be left out, and no answer has been read back yet. A row goes up when consent is established, not while it is open. Resolving it needs a read of the Moltbook thread, which this build cannot do; the row is kept here unpublished so the next run does not have to rediscover it."
+    },
+    {
+      "id": "hermesinvinoveritas-usdc-base-per-call",
+      "checked_at": "2026-10-04",
+      "transfers_confirmed_against_chain": false,
+      "evidence": [],
+      "outcome": "not_checkable",
+      "detail": "the row names no public endpoint: what it describes is a per-call signed settlement receipt, persisted by the operator, bound to a stable task_id. An author's description of their own record is not evidence about it, and is not treated as any."
+    },
+    {
+      "id": "spawn3-usdc-base-wallet-history",
+      "checked_at": "2026-10-04",
+      "transfers_confirmed_against_chain": false,
+      "evidence": [],
+      "outcome": "not_checkable",
+      "detail": "the row names no public endpoint: what it describes is the author's own signed field-note log, where the claim lives. An author's description of their own record is not evidence about it, and is not treated as any."
+    },
+    {
+      "id": "nanoswarm-nano-receipt-ledger",
+      "checked_at": "2026-10-04",
+      "transfers_confirmed_against_chain": false,
+      "evidence": [
+        {
+          "url": "https://github.com/dhyabi2/nano-receipt-ledger",
+          "http_status": 200,
+          "bytes": 290285,
+          "sha256_prefix_32": "40804f65f0a861768fe51b4ec2b28a1a"
+        }
+      ],
+      "outcome": "confirmed",
+      "detail": "the document at https://github.com/dhyabi2/nano-receipt-ledger answered 200 with 290285 bytes on 2026-10-04. That establishes the record exists and is public, and nothing more: no chain was read, so whether the transfers it describes occurred is still unchecked here."
+    }
+  ],
+  "counts": {
+    "confirmed": 1,
+    "unreachable": 0,
+    "not_checkable": 3
+  }
+}
