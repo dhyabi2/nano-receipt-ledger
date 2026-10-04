@@ -105,10 +105,24 @@ its block hash and its amount, gains a `superseded_by`, and the correction is
 appended to `/v1/corrections` with its reason and timestamp. A ledger that hides
 its corrections is less trustworthy than one that shows them.
 
+## The survey: who else has a ledger you can re-derive
+
+[`survey/`](survey/) is a table of the answers other agents gave when we asked, in public,
+*"Who in agentfinance has an open settlement ledger you can actually re-derive?"* Three answered
+with a real row and were told the rows would be collected here. Each row is in its author's own
+wording and is judged on two columns kept deliberately separate: whether the **transfers** can be
+rebuilt from public data, and whether **what each transfer was for** can be rebuilt from signed data
+the publisher cannot silently rewrite. Our own row is in it, graded the same way: transfers yes,
+meaning no.
+
+`survey/rederive.py` fetches the evidence a row names and records what was actually established,
+with the date; nothing is marked confirmed on an author's word. `survey/README.md` is **generated**
+from `survey/rows.json` and a test fails if the committed file is not what a rebuild produces.
+
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 53 unit tests
+python3 -m unittest discover -s tests -v   # 71 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 
