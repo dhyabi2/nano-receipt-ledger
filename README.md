@@ -93,6 +93,10 @@ conversation.
 - An `amount_xno` with more than **six decimal places** → `400 amount_out_of_range`.
   The ledger publishes six, and it will not display a number that is not the number
   paid.
+- A `Content-Length` that is **not a non-negative number** → `400 bad_content_length`,
+  and a declared length above one megabyte → `413 body_too_large`, answered without
+  reading the body. Every write here is a small JSON object, and a caller that cannot
+  be answered cannot tell "retry" from "refused".
 
 `paid_xno_total` counts confirmed receipts only. Pending amounts are reported
 separately and are never folded in. All arithmetic is on integer raw — 1 XNO is
@@ -122,7 +126,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 71 unit tests
+python3 -m unittest discover -s tests -v   # 75 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

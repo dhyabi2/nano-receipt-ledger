@@ -40,6 +40,12 @@ ROUTES = [
 
 APPEND_ONLY_METHODS = ("PUT", "PATCH", "DELETE")
 
+#: The largest request body this service will read. Every body it accepts is a
+#: small JSON object - the longest field, `reason`, is capped at 2000 characters
+#: by `core.MAX_REASON` - so a megabyte is already far more than any real caller
+#: sends, and a declared length beyond it is answered rather than read.
+MAX_BODY_BYTES = 1_000_000
+
 
 def tokens_match(supplied, expected):
     """Constant-time token comparison. Called directly by the auth test."""
@@ -227,10 +233,45 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "receipt-ledger"
     application = None
 
+    def _content_length(self):
+        """The declared body length, or a LedgerError naming what is wrong with it.
+
+        `int()` on this header was unguarded, and the header is whatever the
+        caller wrote. `Content-Length: abc` raised ValueError out of the handler,
+        so the request was answered with NOTHING - the connection was closed with
+        no status line at all - and `Content-Length: -1` was worse: it is truthy,
+        so `rfile.read(-1)` read until the socket closed and the request hung.
+        Both land on `POST /v1/receipts/{id}/attach-block`, the call an agent
+        makes to have its XNO settlement recorded, where "retry this" and "your
+        block was refused" have to be told apart - and neither could be, because
+        there was no reply to read. `node.NodeError` exists for exactly this
+        reason one layer down; this is the same rule at the socket.
+        """
+        declared = self.headers.get("Content-Length")
+        if declared is None:
+            return 0
+        text = declared.strip()
+        if not text:
+            return 0
+        if not text.isascii() or not text.isdigit():
+            raise LedgerError(
+                400, "bad_content_length",
+                "Content-Length must be a non-negative number of bytes, got %r" % declared)
+        length = int(text)
+        if length > MAX_BODY_BYTES:
+            raise LedgerError(
+                413, "body_too_large",
+                "Content-Length declares %d bytes; this ledger reads at most %d"
+                % (length, MAX_BODY_BYTES))
+        return length
+
     def _dispatch(self, method):
         from urllib.parse import parse_qs, urlparse
         parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = self._content_length()
+        except LedgerError as exc:
+            return self._send(exc.status, exc.body())
         raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw.decode("utf-8")) if raw else None
