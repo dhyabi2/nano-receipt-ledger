@@ -707,6 +707,80 @@ class OverARealSocket(unittest.TestCase):
         self.assertIn("Our own funding account's key", body)
 
 
+class AMalformedContentLength(unittest.TestCase):
+    """A bad Content-Length header must be answered, not dropped.
+
+    Written against a raw socket because `urllib` will not send either header:
+    it computes Content-Length itself. The two values below are what a broken
+    or hostile client actually puts on the wire, and both used to reach
+    `int(...)` unguarded in `Handler._dispatch`. `abc` raised ValueError out of
+    the handler and the connection closed with no status line; `-1` is truthy,
+    so `rfile.read(-1)` read until the socket closed and the request never
+    returned. The endpoint is the one an agent calls to have its XNO settlement
+    recorded, so a caller that cannot tell "retry" from "refused" is the harm.
+    """
+
+    def setUp(self):
+        import threading
+        self.application = Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock())
+        self.server = make_server(self.application, "127.0.0.1", 0)
+        self.host, self.port = self.server.server_address[:2]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def raw_request(self, header_value, body=b"{}"):
+        """Send one request verbatim and return whatever came back, if anything."""
+        import socket
+        sock = socket.create_connection((self.host, self.port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /v1/receipts/rcpt_0000000000000000/attach-block HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"X-Ledger-Token: " + TOKEN.encode() + b"\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + header_value + b"\r\n\r\n" + body)
+            chunks = []
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                chunks.append(piece)
+            return b"".join(chunks)
+        except socket.timeout:
+            return b"<the request never returned>"
+        finally:
+            sock.close()
+
+    def assert_json_error(self, answer, status, code):
+        self.assertTrue(answer.startswith(b"HTTP/1."),
+                        "no HTTP response at all: %r" % answer[:120])
+        self.assertIn(b" %d " % status, answer.split(b"\r\n")[0])
+        payload = json.loads(answer.split(b"\r\n\r\n", 1)[1].decode("utf-8"))
+        self.assertEqual(payload["error"], code)
+
+    def test_a_content_length_that_is_not_a_number_is_answered_400(self):
+        self.assert_json_error(self.raw_request(b"abc"), 400, "bad_content_length")
+
+    def test_a_negative_content_length_is_answered_400_and_does_not_hang(self):
+        self.assert_json_error(self.raw_request(b"-1", body=b""), 400, "bad_content_length")
+
+    def test_a_body_larger_than_the_cap_is_answered_413_without_reading_it(self):
+        # The body is never sent: the cap is in the declared length, so the
+        # answer must come back without the service waiting for the bytes.
+        self.assert_json_error(
+            self.raw_request(str(app_module.MAX_BODY_BYTES + 1).encode(), body=b""),
+            413, "body_too_large")
+
+    def test_a_well_formed_length_still_works(self):
+        # The control: the same path with a correct header reaches the ledger
+        # and gets its ordinary 404 for an id that does not exist.
+        self.assert_json_error(self.raw_request(b"2"), 404, "not_found")
+
+
 GUARD_STEP = "No token, seed or key may be committed"
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "test.yml")
 
