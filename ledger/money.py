@@ -8,6 +8,8 @@ source of truth for them; they are vendored here so this repository has no
 dependency of any kind, including on that one.
 """
 
+import re
+
 RAW_PER_XNO = 10 ** 30
 
 # The largest balance a Nano account can hold, in raw: a balance is 128 bits.
@@ -61,50 +63,64 @@ def parse_xno(amount) -> int:
     """
     if not isinstance(amount, str):
         raise AmountError("amount_xno must be a string, got %s" % type(amount).__name__)
+    shown = repr(_clipped(amount))
     text = amount.strip()
+    # The shape is checked first, on what the caller sent, and only then the
+    # range: checked the other way round, "abcdefghijk" was refused as more
+    # than 2**128 - 1 raw, "-0000000001" as too large and "00-1" as negative.
+    # Every refusal quotes the caller's own text (clipped, since leading zeros
+    # can make it arbitrarily long), never a stripped or rewritten form of it.
+    if not text:
+        raise AmountError("amount_xno is empty: %s" % shown)
     # ASCII digits only. `xno_to_raw` checks with `str.isdigit`, which is True
     # for Arabic-Indic and fullwidth digits too, and `int()` reads them, so
     # "\u0661" was accepted as 1 XNO. An amount is written in ASCII; anything
     # else is refused here, before the vendored function is reached.
     if not text.isascii():
-        raise AmountError("amount_xno must be written with ASCII digits: %r"
-                          % _clipped(amount))
-    whole, _, frac = text.partition(".")
-    # Leading zeros carry no value, but `int()` counts them against Python's
-    # 4300-digit limit, so "0" * 5000 + "1" raised ValueError out of `create`
-    # rather than being read as 1. Drop them; MAX_RAW still bounds what is left.
-    stripped = whole.lstrip("0")
-    if stripped != whole:
-        whole = stripped or "0"
-        text = whole + ("." + frac if "." in text else "")
-    if len(whole) > len(str(MAX_RAW // RAW_PER_XNO)):
-        raise AmountError(
-            "amount_xno is more than the 2**128 - 1 raw any Nano account can hold")
+        raise AmountError("amount_xno must be written with ASCII digits: %s" % shown)
+    shape = _DECIMAL.fullmatch(text)
+    if shape is None or not (shape.group("whole") or shape.group("frac")):
+        raise AmountError("amount_xno is not a decimal number: %s" % shown)
+    sign, whole, frac = shape.group("sign", "whole", "frac")
+    frac = frac or ""
+    if sign:
+        raise AmountError("amount_xno must not be negative: %s" % shown)
     if len(frac) > DISPLAY_PLACES:
         raise AmountError(
             "amount_xno carries %d decimal places; this ledger publishes %d, and it "
-            "will not display an amount that is not the amount paid"
-            % (len(frac), DISPLAY_PLACES)
+            "will not display an amount that is not the amount paid: %s"
+            % (len(frac), DISPLAY_PLACES, shown)
         )
+    # Leading zeros carry no value, but `int()` counts them against Python's
+    # 4300-digit limit, so "0" * 5000 + "1" raised ValueError out of `create`
+    # rather than being read as 1. Drop them; MAX_RAW still bounds what is left.
+    whole = whole.lstrip("0") or "0"
+    too_large = AmountError(
+        "amount_xno is more than the 2**128 - 1 raw any Nano account can hold: %s"
+        % shown)
+    if len(whole) > len(str(MAX_RAW // RAW_PER_XNO)):
+        raise too_large
     try:
-        raw = xno_to_raw(text)
+        raw = xno_to_raw(whole + "." + frac if frac else whole)
     except ValueError as exc:
-        # The vendored function's message quotes the text it was handed, and
-        # by here that may be the zero-stripped text, not the caller's: " 0x1"
-        # was reported as 'x1'. Quote what the caller actually sent instead
-        # (clipped, since leading zeros can make it arbitrarily long).
-        raise AmountError(
-            str(exc).replace(repr(text), repr(_clipped(amount)), 1)) from None
+        # Unreachable after the shape check above; kept so that a refusal
+        # from the vendored function is still an AmountError quoting the
+        # caller's text rather than the rewritten one.
+        raise AmountError("amount_xno was refused (%s): %s" % (exc, shown)) from None
     if raw <= 0:
-        raise AmountError("amount_xno must be greater than zero")
+        raise AmountError("amount_xno must be greater than zero: %s" % shown)
     # No Nano account can hold more than 2**128 - 1 raw, so no block can pay
     # more. Without this bound an amount_xno of a few thousand digits parsed,
     # and then `str(raw)` in `Ledger.create` raised ValueError past Python's
     # integer-digit limit and dropped the caller's connection.
     if raw > MAX_RAW:
-        raise AmountError(
-            "amount_xno is more than the 2**128 - 1 raw any Nano account can hold")
+        raise too_large
     return raw
+
+
+# An optional minus (refused, but named as negative), then ASCII digits with at
+# most one dot. `parse_xno` also requires at least one digit, on either side.
+_DECIMAL = re.compile(r"(?P<sign>-?)(?P<whole>[0-9]*)(?:\.(?P<frac>[0-9]*))?")
 
 
 def _clipped(text, width=40):

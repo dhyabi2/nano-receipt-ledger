@@ -96,7 +96,11 @@ conversation.
   positive decimal, one **above `2**128 - 1` raw** (340282366.920938 XNO is the
   largest accepted), and one written with **digits that are not ASCII** (Arabic-Indic
   or fullwidth digits, which `int()` would otherwise read). Leading zeros are
-  dropped before the amount is read, however many there are.
+  dropped before the amount is read, however many there are. The shape is judged
+  before the size — a minus sign, ASCII digits, at most one dot — so `abc` is
+  refused as not a decimal number and `-0000000001` as negative, and every refusal
+  quotes the text the caller sent, clipped to its first 40 characters followed by
+  `...` when it is longer.
 - A `Content-Length` that is **not a non-negative number** → `400 bad_content_length`,
   and a declared length above one megabyte → `413 body_too_large`, answered without
   reading the body. Every write here is a small JSON object, and a caller that cannot
@@ -113,15 +117,23 @@ conversation.
   carrying an `error` field — including a rate limit or other transient refusal —
   is **not** in this list: it is still answered `404 block_not_found`. Nothing is
   written then either, but the code does not say "retry".
-- The node **timeout** (10 seconds) bounds the whole reply — connecting, the
-  status line, the headers and the body together — not each socket read. A node
+- The node **timeout** (10 seconds) bounds the whole reply — each TCP connect, an
+  HTTPS proxy's `CONNECT` reply, the TLS handshake, the status line, the headers
+  and the body together, across any redirects — not each socket read. A node
   that keeps sending a few bytes at a time is cut off when the time is up, and
   that is the same `503 node_unavailable` hold, even if what had arrived so far
-  happened to parse.
+  happened to parse; so is a reply whose connection is held open after its last
+  byte. The one step it does not bound is the **name lookup** of the node's (or
+  proxy's) host: the system resolver cannot be interrupted without a thread of
+  its own, so a resolver that hangs holds the request for as long as it takes. A
+  redirect is followed only to `http` or `https`; one to `ftp`, `file`, `data` or
+  any other scheme is refused at once as the same hold.
 - A node value echoed into a `409 block_mismatch` detail (`subtype`,
-  `destination`, `amount`) is shown as a string of at most 128 characters, so any
-  Nano address (65 characters as `nano_`, 64 as `xrb_`) is shown exactly: a
-  longer one is clipped and anything that is not a string is named by its type.
+  `destination`, `amount`) is shown exactly when it is a string of up to 128
+  characters, so any Nano address (65 characters as `nano_`, 64 as `xrb_`) is shown
+  whole. A longer string is shown as its first 128 characters followed by `... (N
+  characters)`, N being its full length, and anything that is not a string — a
+  number, a list, an object — is named by its type, as `<a int, not a string>`.
   If an answer still cannot be written — as JSON, or as the `text/plain` form —
   the caller gets `500 unencodable_response` rather than a closed connection. A
   stored character UTF-8 cannot carry (a lone surrogate, which JSON allows) appears
@@ -159,7 +171,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 120 unit tests
+python3 -m unittest discover -s tests -v   # 137 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

@@ -1761,9 +1761,10 @@ class ANodeThatTrickles(NodeStubs, unittest.TestCase):
 
     TIMEOUT = 1.0
 
-    def serve_script(self, steps, timeout=None):
+    def serve_script(self, steps, timeout=None, tls=None, scheme="http"):
         """A raw socket node that reads the request, then sends each
-        (pause, bytes) step in turn and stops early once the client hangs up."""
+        (pause, bytes) step in turn and stops early once the client hangs up.
+        `tls` is a server-side SSLContext the connection is wrapped in."""
         import socket
         import threading
         import time
@@ -1780,8 +1781,10 @@ class ANodeThatTrickles(NodeStubs, unittest.TestCase):
                     return
                 try:
                     conn.settimeout(5)
+                    if tls is not None:
+                        conn = tls.wrap_socket(conn, server_side=True)
                     data = b""
-                    while b"\r\n\r\n" not in data:
+                    while not self.whole_request(data):
                         chunk = conn.recv(65536)
                         if not chunk:
                             break
@@ -1796,16 +1799,29 @@ class ANodeThatTrickles(NodeStubs, unittest.TestCase):
 
         threading.Thread(target=loop, daemon=True).start()
         return node_module.NanoNode(
-            "http://127.0.0.1:%d" % listener.getsockname()[1],
+            "%s://127.0.0.1:%d" % (scheme, listener.getsockname()[1]),
             timeout=timeout or self.TIMEOUT)
 
+    @staticmethod
+    def whole_request(data):
+        """True once the request's headers and its Content-Length of body are
+        in: over TLS they arrive as separate records, and closing with the
+        body unread resets the connection before the client reads a reply."""
+        head, found, body = data.partition(b"\r\n\r\n")
+        if not found:
+            return False
+        length = re.search(rb"(?im)^content-length:\s*(\d+)", head)
+        return len(body) >= (int(length.group(1)) if length else 0)
+
     def assert_cut_in_time(self, node):
+        """Cut within half the timeout again: a deadline running at twice
+        its stated length fails this, as a trickle never cut off does."""
         import time
         started = time.monotonic()
         with self.assertRaises(node_module.NodeError) as caught:
             node.block_info(block())
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, self.TIMEOUT + 2.5, "the trickle was not cut off")
+        self.assertLess(elapsed, node.timeout * 1.5, "the trickle was not cut off in time")
         self.assertIn("within", str(caught.exception))
 
     def test_a_body_trickled_eight_bytes_at_a_time_is_cut_at_the_deadline(self):
@@ -1846,6 +1862,252 @@ class ANodeThatTrickles(NodeStubs, unittest.TestCase):
         self.assertEqual(node_module.MAX_REPLY_BYTES, 1024 * 1024)
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
             self.assertRegex(fh.read(), r"over\s+1\s+MiB")
+
+
+class EveryWayAReplyCanArriveIsCutAtTheDeadline(NodeStubs, unittest.TestCase):
+    """The deadline covers redirects, TLS, an HTTPS proxy's tunnel and a reply
+    that has finished but whose connection is held open; and a redirect to a
+    scheme this client does not watch is refused at once.
+    """
+
+    TIMEOUT = ANodeThatTrickles.TIMEOUT
+    serve_script = ANodeThatTrickles.serve_script
+    whole_request = staticmethod(ANodeThatTrickles.whole_request)
+    assert_cut_in_time = ANodeThatTrickles.assert_cut_in_time
+    TRICKLE = [(0.25, b" " * 8)] * 40
+    BODY_HEAD = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                 b"Content-Length: 100000\r\n\r\n")
+
+    def redirect(self, location, then=()):
+        return [(0, b"HTTP/1.1 302 Found\r\nLocation: " + location.encode("ascii")
+                 + b"\r\nConnection: close\r\n\r\n")] + list(then)
+
+    def test_a_redirect_to_ftp_is_refused_at_once(self):
+        """`build_opener` installed an FTP handler, and a redirect to ftp://
+        was followed over a connection the deadline never watched: a banner
+        dripped a byte at a time held the RPC for well over a minute."""
+        import time
+        banner = self.serve_script([(0.25, b"2")] * 200)
+        ftp = banner.url.replace("http://", "ftp://") + "/x.json"
+        node = self.serve_script(self.redirect(ftp))
+        started = time.monotonic()
+        with self.assertRaises(node_module.NodeError) as caught:
+            node.block_info(block())
+        self.assertLess(time.monotonic() - started, node.timeout * 1.5)
+        self.assertIn("ftp", str(caught.exception))
+        status, answer = self.attach_over_http(self.serve_script(self.redirect(ftp)))
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def test_file_and_data_redirects_are_refused(self):
+        for location in ("file:///etc/hostname", "data:application/json,{}"):
+            with self.subTest(location=location):
+                with self.assertRaises(node_module.NodeError):
+                    self.serve_script(self.redirect(location)).block_info(block())
+
+    def test_a_redirect_followed_after_the_deadline_is_cut_at_once(self):
+        """The 302's own body is trickled until the deadline; the redirect is
+        then followed to a node that would trickle for ten seconds more."""
+        target = self.serve_script([(0, self.BODY_HEAD)] + self.TRICKLE)
+        first = self.redirect(target.url + "/x", [(0.25, b".")] * 40)
+        self.assert_cut_in_time(self.serve_script(first))
+
+    def test_a_redirect_then_a_trickle_is_cut_at_the_deadline(self):
+        """The first connection is already closed when the deadline expires;
+        shutting it fails, and the second must still be shut."""
+        target = self.serve_script([(0, self.BODY_HEAD)] + self.TRICKLE)
+        self.assert_cut_in_time(self.serve_script(self.redirect(target.url + "/x")))
+
+    def test_a_complete_reply_on_a_held_connection_is_a_hold(self):
+        """A close-delimited reply sends whole, parseable JSON and then keeps
+        the connection open. Nothing says it has finished, so it is cut at the
+        deadline and not read, though what arrived parses."""
+        steps = [(0, b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                  + self.reply()), (10, b"")]
+        self.assert_cut_in_time(self.serve_script(steps))
+        status, answer = self.attach_over_http(self.serve_script(steps))
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def tls_pair(self):
+        """A throwaway certificate authority and a certificate for 127.0.0.1
+        it signed, made for this test: (server context, CA file to trust)."""
+        import ssl
+        import subprocess
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl is needed to make a test certificate")
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, True)
+
+        def run(*args):
+            subprocess.run(("openssl",) + args, cwd=work, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        curve = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes")
+        run("req", "-x509", *curve, "-keyout", "ca.key", "-out", "ca.pem", "-days", "2",
+            "-subj", "/CN=test-only-ca", "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+        run("req", *curve, "-keyout", "srv.key", "-out", "srv.csr", "-subj", "/CN=127.0.0.1")
+        with open(os.path.join(work, "ext"), "w") as fh:
+            fh.write("subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\n"
+                     "keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n"
+                     "authorityKeyIdentifier=keyid\nsubjectKeyIdentifier=hash\n")
+        run("x509", "-req", "-in", "srv.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+            "-CAcreateserial", "-out", "srv.pem", "-days", "2", "-extfile", "ext")
+        server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server.load_cert_chain(os.path.join(work, "srv.pem"), os.path.join(work, "srv.key"))
+        return server, os.path.join(work, "ca.pem")
+
+    def trusting(self, ca_file):
+        from unittest import mock
+        patch = mock.patch.dict(os.environ, {"SSL_CERT_FILE": ca_file})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_an_https_reply_that_finishes_is_read(self):
+        server, ca_file = self.tls_pair()
+        self.trusting(ca_file)
+        body = self.reply()
+        head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body))
+        node = self.serve_script([(0, head + body)], timeout=5, tls=server, scheme="https")
+        self.assertTrue(node.block_info(block())["found"])
+
+    def test_an_https_body_trickle_is_cut_at_the_deadline(self):
+        server, ca_file = self.tls_pair()
+        self.trusting(ca_file)
+        node = self.serve_script([(0, self.BODY_HEAD)] + self.TRICKLE,
+                                 tls=server, scheme="https")
+        self.assert_cut_in_time(node)
+
+    def test_a_dripping_https_proxy_tunnel_is_cut_at_the_deadline(self):
+        """The CONNECT reply from an HTTPS proxy is read before any TLS, inside
+        `connect`, and was not watched: a proxy dripping it held the RPC."""
+        from unittest import mock
+        reply = b"HTTP/1.1 200 Connection established\r\nX-Pad: " + b"a" * 60 + b"\r\n\r\n"
+        proxy = self.serve_script([(0.25, bytes([b])) for b in reply])
+        env = {key: proxy.url for key in ("https_proxy", "HTTPS_PROXY")}
+        env.update(no_proxy="", NO_PROXY="")
+        with mock.patch.dict(os.environ, env):
+            node = node_module.NanoNode("https://node.invalid:7076/", timeout=self.TIMEOUT)
+            self.assert_cut_in_time(node)
+
+    def test_no_timer_outlives_a_fast_answer(self):
+        import threading
+        body = self.reply()
+        head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body))
+        node = self.serve_script([(0, head + body)], timeout=30)
+        self.assertTrue(node.block_info(block())["found"])
+        timers = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+        for timer in timers:
+            timer.join(2)
+        self.assertEqual([t for t in timers if t.is_alive()], [],
+                         "a deadline timer was left running after the answer")
+
+
+class TheDeadlineItself(unittest.TestCase):
+    def pair(self):
+        import socket
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        theirs.settimeout(2)
+        return ours, theirs
+
+    def test_a_socket_watched_after_expiry_is_shut_at_once(self):
+        deadline = node_module._Deadline(60)
+        deadline.expire()
+        ours, theirs = self.pair()
+        deadline.watch(ours)
+        self.assertEqual(theirs.recv(1), b"")
+
+    def test_a_closed_socket_does_not_stop_the_next_being_shut(self):
+        import socket
+        deadline = node_module._Deadline(60)
+        closed = socket.socket()
+        closed.close()
+        deadline.watch(closed)
+        ours, theirs = self.pair()
+        deadline.watch(ours)
+        deadline.expire()
+        self.assertEqual(theirs.recv(1), b"")
+
+
+class TheEchoLimitAndItsClip(unittest.TestCase):
+    def test_128_characters_are_shown_whole_and_129_are_clipped(self):
+        from core import MAX_SHOWN, _shown_value
+        self.assertEqual(MAX_SHOWN, 128)
+        self.assertEqual(_shown_value("a" * 128), "a" * 128)
+        self.assertEqual(_shown_value("a" * 128 + "b"), "a" * 128 + "... (129 characters)")
+        self.assertEqual(_shown_value("a" * 1000), "a" * 128 + "... (1000 characters)")
+
+    def test_a_non_string_amount_is_named_by_its_type(self):
+        app = Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock())
+        receipt = app.ledger.create({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why"})
+        for amount, shown in ((7, "<a int, not a string>"),
+                              (10 ** 5000, "<a int, not a string>"),
+                              ([1], "<a list, not a string>"),
+                              ("9" * 200, "9" * 128 + "... (200 characters)")):
+            with self.subTest(shown=shown):
+                info = {"found": True, "confirmed": True, "subtype": "send",
+                        "destination": SELLER, "amount_raw": amount}
+                with self.assertRaises(LedgerError) as caught:
+                    app.ledger.attach_block(receipt["id"], block(), info)
+                self.assertEqual(caught.exception.detail["amount"]["got"], shown)
+
+    def test_the_readme_states_the_clip_format(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = " ".join(fh.read().split())
+        self.assertTrue("first 128 characters followed by `... (N characters)`" in readme,
+                        "the README does not state the clip format")
+
+
+class AnAmountRefusalSaysWhatIsWrong(unittest.TestCase):
+    """The shape is judged before the range, on the caller's own text."""
+
+    def refused(self, sent):
+        with self.assertRaises(AmountError) as caught:
+            parse_xno(sent)
+        return str(caught.exception)
+
+    def test_each_refusal_names_the_right_reason_and_quotes_the_text(self):
+        for sent, reason in (("abcdefghijk", "not a decimal number"),
+                             ("-0000000001", "must not be negative"),
+                             ("-1", "must not be negative"),
+                             ("00-1", "not a decimal number"),
+                             ("1.2.3", "not a decimal number"),
+                             ("+1", "not a decimal number"),
+                             (".", "not a decimal number"),
+                             ("", "empty"),
+                             ("0", "greater than zero"),
+                             ("0.0000001", "7 decimal places"),
+                             ("340282366.920939", "2**128 - 1"),
+                             ("9" * 30, "2**128 - 1"),
+                             ("\u0661", "ASCII")):
+            with self.subTest(sent=sent):
+                message = self.refused(sent)
+                self.assertIn(reason, message)
+                self.assertIn(repr(sent), message)
+
+    def test_the_quoted_text_is_clipped_at_40_characters(self):
+        self.assertIn(repr("x" * 40), self.refused("x" * 40))
+        message = self.refused("x" * 41)
+        self.assertIn(repr("x" * 40 + "..."), message)
+        self.assertNotIn("x" * 41, message)
+        message = self.refused("0" * 5000 + "-1")
+        self.assertIn(repr("0" * 40 + "..."), message)
+        self.assertLess(len(message), 200)
+
+    def test_well_formed_amounts_still_parse(self):
+        for sent, raw in (("1", XNO), (".5", XNO // 2), ("1.", XNO),
+                          (" 0001.250000 ", XNO * 5 // 4),
+                          ("0" * 5000 + "1", XNO),
+                          ("340282366.920938", 340282366920938 * 10 ** 24)):
+            with self.subTest(sent=sent[:20]):
+                self.assertEqual(parse_xno(sent), raw)
 
 
 class TheLinkedDepthLimit(Base):

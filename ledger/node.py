@@ -10,6 +10,7 @@ import http.client
 import json
 import socket
 import threading
+import time
 import urllib.request
 
 # The most this client reads of one node reply. A block_info answer is a few
@@ -37,12 +38,22 @@ class _Deadline:
     whatever read is in progress returns at once and the RPC fails as a reply
     that could not be read. A connection that finishes connecting after that
     is shut down as soon as it exists.
+
+    A socket is watched from the moment it is created, before it connects:
+    an HTTPS proxy's CONNECT reply and the TLS handshake are read on that
+    socket, and both used to run before it was watched, so a proxy dripping
+    its reply held the RPC past the deadline. Each connect attempt is also
+    given only the time that is left.
     """
 
-    def __init__(self):
+    def __init__(self, timeout):
         self.expired = False
+        self._at = time.monotonic() + timeout
         self._lock = threading.Lock()
         self._sockets = []
+
+    def remaining(self):
+        return self._at - time.monotonic()
 
     def watch(self, sock):
         with self._lock:
@@ -56,6 +67,39 @@ class _Deadline:
             for sock in self._sockets:
                 _shut(sock)
 
+    def create_connection(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                          source_address=None, *args, **kwargs):
+        """`socket.create_connection`, with each socket watched before it
+        connects and each connect attempt bounded by the time that is left.
+
+        The name lookup (`getaddrinfo`) is the one step not bounded: it cannot
+        be interrupted without a thread of its own, and runs for as long as the
+        system resolver takes.
+        """
+        host, port = address
+        error = None
+        for family, kind, proto, _, sockaddr in socket.getaddrinfo(
+                host, port, 0, socket.SOCK_STREAM):
+            left = self.remaining()
+            if self.expired or left <= 0:
+                raise socket.timeout("the deadline passed before connecting")
+            sock = socket.socket(family, kind, proto)
+            self.watch(sock)
+            try:
+                per_read = (socket.getdefaulttimeout()
+                            if timeout is socket._GLOBAL_DEFAULT_TIMEOUT else timeout)
+                sock.settimeout(left if per_read is None else min(per_read, left))
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(sockaddr)
+                sock.settimeout(per_read)
+                return sock
+            except OSError as exc:
+                error = exc
+                sock.close()
+        raise error if error is not None else OSError(
+            "getaddrinfo returned nothing for %r" % (host,))
+
 
 def _shut(sock):
     try:
@@ -66,8 +110,15 @@ def _shut(sock):
 
 def _watched(connection_class, deadline):
     class Watched(connection_class):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._create_connection = deadline.create_connection
+
         def connect(self):
             super().connect()
+            # For HTTPS, `self.sock` is now the TLS socket that took over the
+            # watched one's file descriptor; watch it too, since shutting the
+            # detached original is an OSError `_shut` ignores.
             deadline.watch(self.sock)
     return Watched
 
@@ -90,10 +141,31 @@ class _HTTPSHandler(urllib.request.HTTPSHandler):
         return super().do_open(_watched(http_class, self.deadline), req, **kwargs)
 
 
+def _opener(deadline):
+    """An opener that speaks http and https and nothing else.
+
+    `build_opener` also installs ftp, file and data handlers, so a node that
+    redirected to `ftp://` was followed over a connection this module does not
+    watch: a slow FTP banner held the RPC for as long as it dripped. Built by
+    hand, a redirect to any other scheme reaches `UnknownHandler`, which
+    raises URLError at once, and that is the same 503 hold.
+    """
+    opener = urllib.request.OpenerDirector()
+    for handler in (urllib.request.ProxyHandler(), urllib.request.UnknownHandler(),
+                    _HTTPHandler(deadline), _HTTPSHandler(deadline),
+                    urllib.request.HTTPDefaultErrorHandler(),
+                    urllib.request.HTTPRedirectHandler(),
+                    urllib.request.HTTPErrorProcessor()):
+        opener.add_handler(handler)
+    return opener
+
+
 class NanoNode:
     def __init__(self, url, timeout=10):
-        """`timeout` is in seconds and bounds the whole RPC: connecting, the
-        status line, the headers and the body together, not only each read."""
+        """`timeout` is in seconds and bounds the whole RPC: each connect, an
+        HTTPS proxy's CONNECT reply, the TLS handshake, the status line, the
+        headers and the body together, across redirects, not only each read.
+        The host name lookup is the one step it does not bound."""
         self.url = url
         self.timeout = timeout
 
@@ -142,9 +214,8 @@ class NanoNode:
         # kept sending. `_Deadline` shuts the socket down once `timeout`
         # seconds have passed in total; a reply not finished by then is the
         # same 503 hold, even if what had arrived happened to parse.
-        deadline = _Deadline()
-        opener = urllib.request.build_opener(
-            _HTTPHandler(deadline), _HTTPSHandler(deadline))
+        deadline = _Deadline(self.timeout)
+        opener = _opener(deadline)
         timer = threading.Timer(self.timeout, deadline.expire)
         timer.daemon = True
         late = NodeError(

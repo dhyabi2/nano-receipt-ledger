@@ -101,21 +101,6 @@ def raw_amount(value):
     return amount if amount <= MAX_RAW else None
 
 
-def _shown_amount(value):
-    """`value` as text for a refusal's detail, never raising and never huge.
-
-    `str()` of an integer past Python's digit limit raises ValueError, and a
-    refusal that raises is a dropped connection, not a refusal.
-    """
-    try:
-        text = str(value)
-    except ValueError:
-        return "<an integer too long to show>"
-    if len(text) > MAX_SHOWN:
-        return "%s... (%d characters)" % (text[:MAX_SHOWN], len(text))
-    return text
-
-
 # How deeply `linked` may nest. A job id or a URL needs one level.
 MAX_LINKED_DEPTH = 16
 
@@ -146,9 +131,14 @@ def _shown_value(value):
     whatever the far end sent. A `subtype` or `link_as_account` nested a
     thousand lists deep parsed on Python 3.12 and then made `json.dumps` raise
     RecursionError while the refusal was being written, which dropped the
-    caller's connection. Only a short string or None is echoed as itself;
-    anything else is named by its type, and a long string is clipped exactly as
-    `_shown_amount` clips an amount.
+    caller's connection. Only a string or None is echoed as itself; anything
+    else is named by its type. A string of more than MAX_SHOWN characters is
+    clipped to its first MAX_SHOWN, followed by "... (N characters)" giving
+    its full length.
+
+    The node's `amount` is shown the same way. It used to be passed through
+    `str()`, so a non-string amount was shown as its text rather than named,
+    and an integer past Python's digit limit needed a special case of its own.
     """
     if value is None:
         return None
@@ -289,7 +279,7 @@ class Ledger:
             want_raw = raw_amount(receipt["amount_raw"])
             if got_raw is None or want_raw is None or got_raw != want_raw:
                 mismatches["amount"] = {
-                    "expected": receipt["amount_raw"], "got": _shown_amount(block_info.get("amount_raw"))}
+                    "expected": receipt["amount_raw"], "got": _shown_value(block_info.get("amount_raw"))}
             if mismatches:
                 raise LedgerError(
                     409, "block_mismatch",
