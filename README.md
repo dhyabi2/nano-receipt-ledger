@@ -97,6 +97,12 @@ conversation.
   and a declared length above one megabyte → `413 body_too_large`, answered without
   reading the body. Every write here is a small JSON object, and a caller that cannot
   be answered cannot tell "retry" from "refused".
+- A node that **did not answer**, or answered something that cannot be read — a
+  refused connection, a timeout, a proxy's HTML page, or a reply whose `contents`
+  came back as an opaque string because the endpoint ignored `json_block` →
+  `503 node_unavailable`, and **nothing is written**, so the receipt is still
+  pending and the retry is safe. This is a hold, never a verdict: no block was
+  judged, so none was refused. Only `409` says a block is wrong.
 
 `paid_xno_total` counts confirmed receipts only. Pending amounts are reported
 separately and are never folded in. All arithmetic is on integer raw — 1 XNO is
@@ -126,7 +132,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 75 unit tests
+python3 -m unittest discover -s tests -v   # 78 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

@@ -624,6 +624,113 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
             proxy.shutdown()
             proxy.server_close()
 
+    def test_a_node_that_ignores_json_block_is_a_503_not_a_dropped_connection(self):
+        """`contents` as an opaque string crashed `normalise` with AttributeError.
+
+        `block_info` is asked with `json_block: "true"`, and a node that honours
+        it answers `contents` as an object. An endpoint that ignores the flag
+        answers it as a JSON *string* instead - the same class of behaviour this
+        repository's sibling records first-hand of `rpc.nano.to`, which silently
+        ignores `raw: "true"` on `account_history`. `normalise` then ran
+        `"...".get("link_as_account")`:
+
+            AttributeError: 'str' object has no attribute 'get'
+
+        raised outside `rpc`'s own `except (OSError, ValueError)`, so it went
+        past `Handler._dispatch` (LedgerError only) exactly as the transport
+        exception above used to, and the agent proving its XNO settlement got
+        its connection closed with no HTTP response at all.
+
+        It must be a hold, not a verdict: nothing was read, so nothing is known
+        about the block. That is what `NodeError` and 503 `node_unavailable`
+        mean here, and `node.py`'s own docstring says so - "it says the node did
+        not answer, never that a block is bad".
+        """
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class IgnoresJsonBlock(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.dumps({
+                    "block_account": SELLER,
+                    "amount": str(XNO // 100),
+                    "confirmed": "true",
+                    "subtype": "send",
+                    # A real node asked without json_block answers this as a
+                    # string. Here the flag was sent and ignored.
+                    "contents": json.dumps({"type": "state",
+                                            "link_as_account": SELLER}),
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        endpoint = HTTPServer(("127.0.0.1", 0), IgnoresJsonBlock)
+        threading.Thread(target=endpoint.serve_forever, daemon=True).start()
+        try:
+            node = node_module.NanoNode(
+                "http://127.0.0.1:%d" % endpoint.server_address[1], timeout=5)
+            with self.assertRaises(node_module.NodeError):
+                node.block_info(block())
+
+            application = Application(store=Store(), node=node, token=TOKEN, clock=Clock())
+            _, receipt = application.handle(
+                "POST", "/v1/receipts", {}, {"X-Ledger-Token": TOKEN}, {
+                    "kind": "work_settlement", "counterparty": "arion",
+                    "counterparty_address": SELLER, "amount_xno": "0.010000",
+                    "reason": "delivered the extraction job"})
+            with self.assertRaises(LedgerError) as caught:
+                application.handle(
+                    "POST", "/v1/receipts/%s/attach-block" % receipt["id"], {},
+                    {"X-Ledger-Token": TOKEN}, {"block_hash": block()})
+            self.assertEqual(caught.exception.status, 503)
+            self.assertEqual(caught.exception.code, "node_unavailable")
+
+            # And the retry the message promises is safe: nothing was written.
+            _, pending = application.handle(
+                "GET", "/v1/receipts/%s" % receipt["id"], {}, {}, None)
+            self.assertIsNone(pending["block_hash"])
+            self.assertFalse(pending["confirmed"])
+        finally:
+            endpoint.shutdown()
+            endpoint.server_close()
+
+    def test_normalise_holds_on_a_reply_whose_contents_cannot_be_read(self):
+        """The unit form of the case above, for every shape `contents` can take.
+
+        A reply that names a block and carries no readable `contents` says
+        nothing about where the money went. Refusing it as a mismatch would
+        accuse a buyer who paid; this raises instead, and the HTTP layer turns
+        it into the documented retry.
+        """
+        for contents in ('{"link_as_account": "%s"}' % SELLER, None, 7, [], "null"):
+            with self.subTest(contents=contents):
+                with self.assertRaises(node_module.NodeError):
+                    node_module.normalise({"confirmed": "true", "subtype": "send",
+                                           "amount": "1", "contents": contents})
+
+    def test_normalise_still_reads_every_answer_it_read_before(self):
+        """Control: the two shapes that worked are untouched, field for field.
+
+        A node error answer is still a not-found, and a well-formed answer still
+        yields the same five facts - so this adds a hold and takes no verdict
+        away.
+        """
+        self.assertEqual(
+            node_module.normalise({"error": "Block not found"}),
+            {"found": False, "confirmed": False, "subtype": None,
+             "destination": None, "amount_raw": None})
+        self.assertEqual(
+            node_module.normalise({"confirmed": "true", "subtype": "send",
+                                   "amount": "10", "contents": {"link_as_account": SELLER}}),
+            {"found": True, "confirmed": True, "subtype": "send",
+             "destination": SELLER, "amount_raw": "10"})
+
     def test_a_send_shaped_action_still_raises_loudly(self):
         """The fix must not turn the repository's own tripwire into a 503.
 

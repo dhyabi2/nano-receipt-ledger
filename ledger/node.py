@@ -60,11 +60,33 @@ class NanoNode:
 
 
 def normalise(answer):
-    """Reduce a node's block_info answer to the five facts the ledger checks."""
+    """Reduce a node's block_info answer to the five facts the ledger checks.
+
+    Raises NodeError for an answer that names a block whose `contents` cannot
+    be read. `block_info` is asked with `json_block: "true"`; an endpoint that
+    ignores the flag answers `contents` as an opaque JSON *string*, and
+    `"...".get("link_as_account")` is an AttributeError - raised outside
+    `rpc`'s own guard, so it went past the HTTP layer, which answers only
+    LedgerError, and closed the caller's connection with no response. A public
+    endpoint silently dropping a request flag is not hypothetical: the sibling
+    repository records `rpc.nano.to` doing exactly that with `raw: "true"` on
+    `account_history`.
+
+    It is a NodeError and not a mismatch because nothing was read: where the
+    money went is unknown, not wrong. Reporting it as a wrong destination would
+    accuse a buyer who really had paid, and `attach_block` cannot be retried
+    into a different verdict - a mismatch is the end of that receipt. 503
+    `node_unavailable` tells the caller to ask again, which is the truth.
+    """
     if not isinstance(answer, dict) or "error" in answer:
         return {"found": False, "confirmed": False, "subtype": None,
                 "destination": None, "amount_raw": None}
-    contents = answer.get("contents") or {}
+    contents = answer.get("contents")
+    if not isinstance(contents, dict):
+        raise NodeError(
+            "the reply names a block but its contents are %s, not an object, so the "
+            "account it paid cannot be read; nothing was judged"
+            % type(contents).__name__)
     return {
         "found": True,
         "confirmed": str(answer.get("confirmed", "false")).lower() == "true",
