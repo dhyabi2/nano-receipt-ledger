@@ -9,6 +9,7 @@ and passes its *answer* to the core.
 import http.client
 import json
 import socket
+import ssl
 import threading
 import time
 import urllib.request
@@ -40,13 +41,22 @@ class _Deadline:
     is shut down as soon as it exists.
 
     A socket is watched from the moment it is created, before it connects:
-    an HTTPS proxy's CONNECT reply and the TLS handshake are read on that
-    socket, and both used to run before it was watched, so a proxy dripping
-    its reply held the RPC past the deadline. Each connect attempt is also
-    given only the time that is left.
+    an HTTPS proxy's CONNECT reply is read on that socket and used to run
+    before it was watched, so a proxy dripping its reply held the RPC past
+    the deadline. The TLS socket that takes the connection over is watched
+    before its handshake starts, not after it ends: `wrap_socket` detaches
+    the plain socket, so shutting that one no longer reaches the connection,
+    and a server dripping its ServerHello held the RPC for about one more
+    timeout.
+
+    As a second bound, every socket operation that waits - each connect
+    attempt, the handshake and each read - is given a socket timeout of the
+    per-read timeout or the time that is left, whichever is smaller, so
+    nothing waits past the deadline even before the shutdown arrives.
     """
 
     def __init__(self, timeout):
+        self.timeout = timeout
         self.expired = False
         self._at = time.monotonic() + timeout
         self._lock = threading.Lock()
@@ -54,6 +64,12 @@ class _Deadline:
 
     def remaining(self):
         return self._at - time.monotonic()
+
+    def passed(self):
+        """True once the timer has run or the time is up, whichever came
+        first: a socket timeout capped at the time left can end a read a
+        moment before the timer fires."""
+        return self.expired or self.remaining() <= 0
 
     def watch(self, sock):
         with self._lock:
@@ -67,38 +83,142 @@ class _Deadline:
             for sock in self._sockets:
                 _shut(sock)
 
+    def release(self):
+        """Close every connection the RPC opened, once it is over.
+
+        A connection is otherwise closed only when the garbage collector gets
+        to it: an error reply (a 500, or a redirect whose body was cut at the
+        deadline) is held by the exception that reported it, and a socket the
+        collector reached before the file object reading it was reported as
+        never closed. Nothing reads from these sockets after the RPC, so the
+        descriptor is closed outright, even while a file object still holds a
+        reference to it."""
+        with self._lock:
+            sockets, self._sockets = self._sockets, []
+        for sock in sockets:
+            try:
+                sock.close()
+                sock._real_close()
+            except OSError:
+                pass
+
+    def wait_for(self, per_read):
+        """The socket timeout for the next wait: `per_read` (None meaning
+        no per-read bound) or the time left, whichever is smaller. Once no
+        time is left the deadline is expired here, so the RPC reports it in
+        the same words as one the timer ended, and socket.timeout is raised
+        without anything being waited for."""
+        left = self.remaining()
+        if self.expired or left <= 0:
+            self.expire()
+            raise socket.timeout(
+                "the deadline of %s seconds passed before this step" % self.timeout)
+        return left if per_read is None else min(per_read, left)
+
     def create_connection(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
                           source_address=None, *args, **kwargs):
         """`socket.create_connection`, with each socket watched before it
         connects and each connect attempt bounded by the time that is left.
+
+        Like `socket.create_connection`, every address the name resolves to is
+        tried in turn: a socket that cannot be opened (an address family the
+        host does not support, as IPv6 on a host with it turned off) or cannot
+        connect is closed and the next address is tried, and the last error is
+        raised only when none connected. The deadline is checked before each
+        attempt, before any socket is opened for it.
 
         The name lookup (`getaddrinfo`) is the one step not bounded: it cannot
         be interrupted without a thread of its own, and runs for as long as the
         system resolver takes.
         """
         host, port = address
+        per_read = (socket.getdefaulttimeout()
+                    if timeout is socket._GLOBAL_DEFAULT_TIMEOUT else timeout)
         error = None
         for family, kind, proto, _, sockaddr in socket.getaddrinfo(
                 host, port, 0, socket.SOCK_STREAM):
-            left = self.remaining()
-            if self.expired or left <= 0:
-                raise socket.timeout("the deadline passed before connecting")
-            sock = socket.socket(family, kind, proto)
-            self.watch(sock)
+            wait = self.wait_for(per_read)
+            sock = None
             try:
-                per_read = (socket.getdefaulttimeout()
-                            if timeout is socket._GLOBAL_DEFAULT_TIMEOUT else timeout)
-                sock.settimeout(left if per_read is None else min(per_read, left))
+                sock = _PlainSocket(family, kind, proto)
+                self.watch(sock)
+                sock.settimeout(wait)
                 if source_address:
                     sock.bind(source_address)
                 sock.connect(sockaddr)
-                sock.settimeout(per_read)
+                sock.bound_by(self, per_read)
                 return sock
             except OSError as exc:
                 error = exc
-                sock.close()
-        raise error if error is not None else OSError(
-            "getaddrinfo returned nothing for %r" % (host,))
+                if sock is not None:
+                    sock.close()
+        try:
+            raise error if error is not None else OSError(
+                "getaddrinfo returned nothing for %r" % (host,))
+        finally:
+            error = None  # as socket.create_connection does: no reference cycle
+
+
+class _Bounded:
+    """Sets the socket timeout to `_Deadline.wait_for` before each read."""
+
+    _deadline = None
+    _per_read = None
+
+    def bound_by(self, deadline, per_read):
+        self._deadline, self._per_read = deadline, per_read
+        self.settimeout(deadline.wait_for(per_read))
+
+    def _rebound(self):
+        if self._deadline is not None:
+            self.settimeout(self._deadline.wait_for(self._per_read))
+
+    def recv(self, *args, **kwargs):
+        self._rebound()
+        return super().recv(*args, **kwargs)
+
+    def recv_into(self, *args, **kwargs):
+        self._rebound()
+        return super().recv_into(*args, **kwargs)
+
+
+class _PlainSocket(_Bounded, socket.socket):
+    pass
+
+
+class _TLSSocket(_Bounded, ssl.SSLSocket):
+    pass
+
+
+class _BoundedContext:
+    """An SSLContext whose `wrap_socket` watches the TLS socket and bounds its
+    handshake before the handshake starts. Everything else is the context's."""
+
+    def __init__(self, context, deadline):
+        # Set on this instance only. The context is this RPC's own: urllib and
+        # http.client make one per handler or per connection when, as here,
+        # none is passed in.
+        context.sslsocket_class = _TLSSocket
+        self._context = context
+        self._deadline = deadline
+
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
+    def wrap_socket(self, sock, *args, **kwargs):
+        handshake = kwargs.pop("do_handshake_on_connect", True)
+        per_read = sock._per_read if isinstance(sock, _Bounded) else sock.gettimeout()
+        tls = self._context.wrap_socket(
+            sock, *args, do_handshake_on_connect=False, **kwargs)
+        try:
+            self._deadline.watch(tls)
+            tls.bound_by(self._deadline, per_read)
+            if handshake:
+                tls.do_handshake()
+        except BaseException:
+            tls.close()
+            raise
+        return tls
 
 
 def _shut(sock):
@@ -113,13 +233,11 @@ def _watched(connection_class, deadline):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self._create_connection = deadline.create_connection
-
-        def connect(self):
-            super().connect()
-            # For HTTPS, `self.sock` is now the TLS socket that took over the
-            # watched one's file descriptor; watch it too, since shutting the
-            # detached original is an OSError `_shut` ignores.
-            deadline.watch(self.sock)
+            context = getattr(self, "_context", None)
+            if context is not None:
+                # HTTPS: the TLS socket that takes over the watched plain
+                # one is watched, and bounded, before its handshake.
+                self._context = _BoundedContext(context, deadline)
     return Watched
 
 
@@ -228,7 +346,8 @@ class NanoNode:
                     body = response.read(MAX_REPLY_BYTES + 1)
             finally:
                 timer.cancel()
-            if deadline.expired:
+                deadline.release()
+            if deadline.passed():
                 raise late
             if len(body) > MAX_REPLY_BYTES:
                 raise NodeError(
@@ -237,7 +356,7 @@ class NanoNode:
                     % (self.url, action, MAX_REPLY_BYTES))
             return json.loads(body.decode("utf-8"))
         except (OSError, ValueError, RecursionError, http.client.HTTPException) as exc:
-            if deadline.expired:
+            if deadline.passed():
                 raise late from None
             raise NodeError("%s did not answer %s: %s" % (self.url, action, exc)) from None
 
