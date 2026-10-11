@@ -1750,14 +1750,8 @@ class APlainTextReceiptIsAlwaysAnswered(unittest.TestCase):
         self.assertEqual(json.loads(body)["error"], "unencodable_response")
 
 
-class ANodeThatTrickles(NodeStubs, unittest.TestCase):
-    """`timeout` bounds the whole node reply, not each socket read.
-
-    A node that sends a few bytes at a time, each well inside the per-read
-    timeout, never tripped it, so it could hold an attach request for as long
-    as it kept sending. Each stub below would run for ten seconds or more; the
-    deadline has to end it in about one.
-    """
+class ScriptedNode(NodeStubs):
+    """A raw socket node that plays a script of (pause, bytes) steps."""
 
     TIMEOUT = 1.0
 
@@ -1813,29 +1807,11 @@ class ANodeThatTrickles(NodeStubs, unittest.TestCase):
         length = re.search(rb"(?im)^content-length:\s*(\d+)", head)
         return len(body) >= (int(length.group(1)) if length else 0)
 
-    def assert_cut_in_time(self, node):
-        """Cut within half the timeout again: a deadline running at twice
-        its stated length fails this, as a trickle never cut off does."""
-        import time
-        started = time.monotonic()
-        with self.assertRaises(node_module.NodeError) as caught:
-            node.block_info(block())
-        elapsed = time.monotonic() - started
-        self.assertLess(elapsed, node.timeout * 1.5, "the trickle was not cut off in time")
-        self.assertIn("within", str(caught.exception))
 
-    def test_a_body_trickled_eight_bytes_at_a_time_is_cut_at_the_deadline(self):
-        head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-                b"Content-Length: 100000\r\n\r\n")
-        steps = [(0, head)] + [(0.25, b" " * 8)] * 40
-        self.assert_cut_in_time(self.serve_script(steps))
-        status, answer = self.attach_over_http(self.serve_script(steps))
-        self.assertEqual(status, 503, answer)
-        self.assertEqual(answer["error"], "node_unavailable")
 
-    def test_headers_trickled_one_at_a_time_are_cut_at_the_deadline(self):
-        steps = [(0, b"HTTP/1.0 200 OK\r\n")] + [(0.25, b"X-a: bb\r\n")] * 40
-        self.assert_cut_in_time(self.serve_script(steps))
+class ANodeThatIsSlowOrLarge(ScriptedNode, unittest.TestCase):
+    """`timeout` bounds each connect attempt and each read, as on main; a
+    reply is also bounded in size."""
 
     def test_a_slow_reply_that_finishes_in_time_is_still_read(self):
         body = self.reply()
@@ -1844,9 +1820,22 @@ class ANodeThatTrickles(NodeStubs, unittest.TestCase):
         steps = [(0, head), (0.1, body[:10]), (0.1, body[10:20]), (0.1, body[20:])]
         self.assertTrue(self.serve_script(steps, timeout=5).block_info(block())["found"])
 
+    def test_a_node_that_goes_silent_is_a_503_hold_after_one_read_timeout(self):
+        import time
+        head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 100000\r\n\r\n")
+        steps = [(0, head), (10, b"")]
+        node = self.serve_script(steps)
+        started = time.monotonic()
+        with self.assertRaises(node_module.NodeError):
+            node.block_info(block())
+        self.assertLess(time.monotonic() - started, node.timeout * 3)
+        status, answer = self.attach_over_http(self.serve_script(steps))
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
     def test_a_node_streaming_without_end_is_cut_at_the_size_limit(self):
-        """The read stops at MAX_REPLY_BYTES + 1 and says so, long before the
-        deadline: the size bound, not the clock, is what ends this one."""
+        """The read stops at MAX_REPLY_BYTES + 1 and says so."""
         import time
         head = b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n"
         steps = [(0, head)] + [(0, b" " * 65536)] * 1000
@@ -1863,29 +1852,24 @@ class ANodeThatTrickles(NodeStubs, unittest.TestCase):
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
             self.assertRegex(fh.read(), r"over\s+1\s+MiB")
 
+    def test_the_readme_says_the_timeout_is_per_attempt_and_per_read(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertRegex(text, r"each\s+connect\s+attempt\s+and\s+each\s+read")
+        self.assertNotRegex(text, r"one\s+deadline\s+for\s+the\s+whole")
 
-class EveryWayAReplyCanArriveIsCutAtTheDeadline(NodeStubs, unittest.TestCase):
-    """The deadline covers redirects, TLS, an HTTPS proxy's tunnel and a reply
-    that has finished but whose connection is held open; and a redirect to a
-    scheme this client does not watch is refused at once.
-    """
 
-    TIMEOUT = ANodeThatTrickles.TIMEOUT
-    serve_script = ANodeThatTrickles.serve_script
-    whole_request = staticmethod(ANodeThatTrickles.whole_request)
-    assert_cut_in_time = ANodeThatTrickles.assert_cut_in_time
-    TRICKLE = [(0.25, b" " * 8)] * 40
-    BODY_HEAD = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-                 b"Content-Length: 100000\r\n\r\n")
+class ARedirectOrATLSReply(ScriptedNode, unittest.TestCase):
+    """Redirects are followed only to http and https; https is verified with
+    the standard context."""
 
-    def redirect(self, location, then=()):
+    def redirect(self, location):
         return [(0, b"HTTP/1.1 302 Found\r\nLocation: " + location.encode("ascii")
-                 + b"\r\nConnection: close\r\n\r\n")] + list(then)
+                 + b"\r\nConnection: close\r\n\r\n")]
 
     def test_a_redirect_to_ftp_is_refused_at_once(self):
         """`build_opener` installed an FTP handler, and a redirect to ftp://
-        was followed over a connection the deadline never watched: a banner
-        dripped a byte at a time held the RPC for well over a minute."""
+        was followed: a banner dripped a byte at a time held the RPC."""
         import time
         banner = self.serve_script([(0.25, b"2")] * 200)
         ftp = banner.url.replace("http://", "ftp://") + "/x.json"
@@ -1900,34 +1884,20 @@ class EveryWayAReplyCanArriveIsCutAtTheDeadline(NodeStubs, unittest.TestCase):
         self.assertEqual(answer["error"], "node_unavailable")
 
     def test_file_and_data_redirects_are_refused(self):
+        import time
         for location in ("file:///etc/hostname", "data:application/json,{}"):
             with self.subTest(location=location):
+                started = time.monotonic()
                 with self.assertRaises(node_module.NodeError):
                     self.serve_script(self.redirect(location)).block_info(block())
+                self.assertLess(time.monotonic() - started, 1.5)
 
-    def test_a_redirect_followed_after_the_deadline_is_cut_at_once(self):
-        """The 302's own body is trickled until the deadline; the redirect is
-        then followed to a node that would trickle for ten seconds more."""
-        target = self.serve_script([(0, self.BODY_HEAD)] + self.TRICKLE)
-        first = self.redirect(target.url + "/x", [(0.25, b".")] * 40)
-        self.assert_cut_in_time(self.serve_script(first))
-
-    def test_a_redirect_then_a_trickle_is_cut_at_the_deadline(self):
-        """The first connection is already closed when the deadline expires;
-        shutting it fails, and the second must still be shut."""
-        target = self.serve_script([(0, self.BODY_HEAD)] + self.TRICKLE)
-        self.assert_cut_in_time(self.serve_script(self.redirect(target.url + "/x")))
-
-    def test_a_complete_reply_on_a_held_connection_is_a_hold(self):
-        """A close-delimited reply sends whole, parseable JSON and then keeps
-        the connection open. Nothing says it has finished, so it is cut at the
-        deadline and not read, though what arrived parses."""
-        steps = [(0, b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n"
-                  + self.reply()), (10, b"")]
-        self.assert_cut_in_time(self.serve_script(steps))
-        status, answer = self.attach_over_http(self.serve_script(steps))
-        self.assertEqual(status, 503, answer)
-        self.assertEqual(answer["error"], "node_unavailable")
+    def test_a_redirect_to_another_http_node_is_followed(self):
+        body = self.reply()
+        target = self.serve_script([(0, b"HTTP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n"
+                                     % len(body) + body)], timeout=5)
+        node = self.serve_script(self.redirect(target.url + "/x"), timeout=5)
+        self.assertTrue(node.block_info(block())["found"])
 
     def tls_pair(self):
         """A throwaway certificate authority and a certificate for 127.0.0.1
@@ -1973,65 +1943,15 @@ class EveryWayAReplyCanArriveIsCutAtTheDeadline(NodeStubs, unittest.TestCase):
         node = self.serve_script([(0, head + body)], timeout=5, tls=server, scheme="https")
         self.assertTrue(node.block_info(block())["found"])
 
-    def test_an_https_body_trickle_is_cut_at_the_deadline(self):
-        server, ca_file = self.tls_pair()
-        self.trusting(ca_file)
-        node = self.serve_script([(0, self.BODY_HEAD)] + self.TRICKLE,
-                                 tls=server, scheme="https")
-        self.assert_cut_in_time(node)
-
-    def test_a_dripping_https_proxy_tunnel_is_cut_at_the_deadline(self):
-        """The CONNECT reply from an HTTPS proxy is read before any TLS, inside
-        `connect`, and was not watched: a proxy dripping it held the RPC."""
-        from unittest import mock
-        reply = b"HTTP/1.1 200 Connection established\r\nX-Pad: " + b"a" * 60 + b"\r\n\r\n"
-        proxy = self.serve_script([(0.25, bytes([b])) for b in reply])
-        env = {key: proxy.url for key in ("https_proxy", "HTTPS_PROXY")}
-        env.update(no_proxy="", NO_PROXY="")
-        with mock.patch.dict(os.environ, env):
-            node = node_module.NanoNode("https://node.invalid:7076/", timeout=self.TIMEOUT)
-            self.assert_cut_in_time(node)
-
-    def test_no_timer_outlives_a_fast_answer(self):
-        import threading
+    def test_an_https_node_with_an_untrusted_certificate_is_a_503_hold(self):
+        server, _ = self.tls_pair()
         body = self.reply()
         head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
                 b"Content-Length: %d\r\n\r\n" % len(body))
-        node = self.serve_script([(0, head + body)], timeout=30)
-        self.assertTrue(node.block_info(block())["found"])
-        timers = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
-        for timer in timers:
-            timer.join(2)
-        self.assertEqual([t for t in timers if t.is_alive()], [],
-                         "a deadline timer was left running after the answer")
-
-
-class TheDeadlineItself(unittest.TestCase):
-    def pair(self):
-        import socket
-        ours, theirs = socket.socketpair()
-        self.addCleanup(ours.close)
-        self.addCleanup(theirs.close)
-        theirs.settimeout(2)
-        return ours, theirs
-
-    def test_a_socket_watched_after_expiry_is_shut_at_once(self):
-        deadline = node_module._Deadline(60)
-        deadline.expire()
-        ours, theirs = self.pair()
-        deadline.watch(ours)
-        self.assertEqual(theirs.recv(1), b"")
-
-    def test_a_closed_socket_does_not_stop_the_next_being_shut(self):
-        import socket
-        deadline = node_module._Deadline(60)
-        closed = socket.socket()
-        closed.close()
-        deadline.watch(closed)
-        ours, theirs = self.pair()
-        deadline.watch(ours)
-        deadline.expire()
-        self.assertEqual(theirs.recv(1), b"")
+        node = self.serve_script([(0, head + body)], timeout=5, tls=server, scheme="https")
+        with self.assertRaises(node_module.NodeError) as caught:
+            node.block_info(block())
+        self.assertIn("CERTIFICATE", str(caught.exception).upper())
 
 
 class TheEchoLimitAndItsClip(unittest.TestCase):
@@ -2163,7 +2083,7 @@ class AnAmountErrorQuotesTheCallersText(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# the fifth review of the deadline
+# the transport is the standard one again
 # --------------------------------------------------------------------------
 
 def open_fds():
@@ -2176,13 +2096,13 @@ FD_SLACK = 5
 
 
 class EveryAddressIsTried(NodeStubs, unittest.TestCase):
-    """`create_connection` tries each address the name resolves to, as
-    `socket.create_connection` does, and closes each socket that failed.
+    """Each address the name resolves to is tried in turn, by the standard
+    `socket.create_connection`, with the timeout applying to each attempt.
 
-    The socket for an attempt was opened outside the guard that moves on to
-    the next address, so an address family the host cannot open (`::1` on a
-    host with IPv6 turned off answers EAFNOSUPPORT) ended the RPC instead of
-    falling back to the IPv4 address after it.
+    A replacement transport tried here once shared one budget across all
+    attempts: an address family the host cannot open (`::1` on a host with
+    IPv6 turned off) ended the RPC, and a first address that silently drops
+    packets used up the whole budget so the working one was never tried.
     """
 
     HOST = "several.addresses.test"
@@ -2235,41 +2155,6 @@ class EveryAddressIsTried(NodeStubs, unittest.TestCase):
         self.assertEqual(status, 503, answer)
         self.assertEqual(answer["error"], "node_unavailable")
 
-    def test_the_sockets_of_failed_attempts_are_closed(self):
-        port, live = self.live()
-        self.resolving_to(self.unopenable, self.refused, self.refused, live)
-        deadline = node_module._Deadline(30)
-        deadline.create_connection((self.HOST, port), 5).close()
-        before = open_fds()
-        for _ in range(20):
-            deadline.create_connection((self.HOST, port), 5).close()
-        self.assertLess(open_fds() - before, FD_SLACK,
-                        "a failed attempt's socket was left open")
-
-    def test_an_expired_deadline_opens_no_socket(self):
-        port, _ = self.live()
-        deadline = node_module._Deadline(0)
-        before = open_fds()
-        for _ in range(20):
-            with self.assertRaises(OSError):
-                deadline.create_connection(("127.0.0.1", port), 5)
-        self.assertLess(open_fds() - before, FD_SLACK,
-                        "a socket was opened past the deadline")
-        self.assertTrue(deadline.expired)
-
-
-class TheTimeLeftBoundsEachWait(NodeStubs, unittest.TestCase):
-    """Each connect, handshake and read waits for the per-read timeout or the
-    time left, whichever is smaller, and a TLS handshake is cut at the
-    deadline as a read is."""
-
-    TIMEOUT = ANodeThatTrickles.TIMEOUT
-    serve_script = ANodeThatTrickles.serve_script
-    whole_request = staticmethod(ANodeThatTrickles.whole_request)
-    assert_cut_in_time = ANodeThatTrickles.assert_cut_in_time
-    # A TLS record header promising 16 KiB of handshake, then one byte at a time.
-    HELLO_DRIP = [(0, b"\x16\x03\x03\x40\x00")] + [(0.1, b"\x00")] * 100
-
     def blackhole(self):
         """A loopback address whose connects hang: its accept queue is full
         and never drained, so every further SYN is dropped."""
@@ -2290,263 +2175,65 @@ class TheTimeLeftBoundsEachWait(NodeStubs, unittest.TestCase):
             self.addCleanup(probe.close)
         self.skipTest("this host does not drop connects to a full accept queue")
 
-    def test_a_dripping_proxy_tunnel_then_a_dripping_server_hello_is_cut_in_time(self):
-        """The CONNECT reply takes most of the time, then the ServerHello
-        drips. The handshake ran with a fresh full timeout on a socket the
-        deadline no longer reached, so the RPC took about twice its timeout."""
-        from unittest import mock
-        reply = b"HTTP/1.1 200 Connection established\r\nX-Pad: " + b"a" * 40 + b"\r\n\r\n"
-        step = 0.8 * self.TIMEOUT / len(reply)
-        proxy = self.serve_script([(step, bytes([b])) for b in reply] + self.HELLO_DRIP)
-        env = {key: proxy.url for key in ("https_proxy", "HTTPS_PROXY")}
-        env.update(no_proxy="", NO_PROXY="")
-        with mock.patch.dict(os.environ, env):
-            node = node_module.NanoNode("https://node.invalid:7076/", timeout=self.TIMEOUT)
-            self.assert_cut_in_time(node)
-
-    def test_a_dripping_server_hello_is_cut_in_time(self):
-        self.assert_cut_in_time(self.serve_script(self.HELLO_DRIP, scheme="https"))
-
-    def test_a_redirect_late_in_the_deadline_to_a_blackhole_is_cut_in_time(self):
-        host, port = self.blackhole()
-        first = [(0.8 * self.TIMEOUT, b"HTTP/1.1 302 Found\r\nLocation: http://%s:%d/\r\n"
-                  b"Connection: close\r\n\r\n" % (host.encode("ascii"), port))]
-        self.assert_cut_in_time(self.serve_script(first))
-
-    def test_a_connect_waits_only_for_the_time_left(self):
-        """Without the timer: the connect itself gives up when the time is
-        up, though the per-read timeout would let it wait for ten seconds."""
+    def test_a_blackholed_first_address_then_a_live_one_succeeds(self):
+        """The first attempt times out after `timeout`, then the live address
+        answers: within about twice the timeout, as on main."""
         import socket
         import time
-        address = self.blackhole()
-        deadline = node_module._Deadline(0.3)
+        host, dropped = self.blackhole()
+        port, live = self.live()
+        self.resolving_to(
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, dropped)), live)
+        node = node_module.NanoNode("http://%s:%d/" % (self.HOST, port), timeout=0.5)
         started = time.monotonic()
-        with self.assertRaises(socket.timeout):
-            deadline.create_connection(address, 10)
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertTrue(node.block_info(block())["found"])
+        self.assertLess(time.monotonic() - started, 2 * node.timeout + 0.5)
 
-    def silent(self):
-        """A loopback listener that accepts and then never says anything."""
-        import socket
-        listener = socket.socket()
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(8)
-        self.addCleanup(listener.close)
-        return listener.getsockname()
-
-    def test_each_read_waits_only_for_the_time_left_then(self):
-        """The timeout is set again before every read, not once at connect:
-        a read that starts 0.7 s into a 1 s deadline waits 0.3 s, not 1 s."""
-        import socket
-        import time
-        address = self.silent()
-        for how in ("recv", "recv_into"):
-            with self.subTest(read=how):
-                started = time.monotonic()
-                sock = node_module._Deadline(1.0).create_connection(address, 10)
-                self.addCleanup(sock.close)
-                time.sleep(0.7)
-                with self.assertRaises(socket.timeout):
-                    if how == "recv":
-                        sock.recv(1)
-                    else:
-                        sock.recv_into(bytearray(1))
-                self.assertLess(time.monotonic() - started, 1.35)
-
-    def test_each_read_waits_only_for_the_per_read_timeout_when_that_is_less(self):
-        import socket
-        import time
-        sock = node_module._Deadline(30).create_connection(self.silent(), 0.2)
-        self.addCleanup(sock.close)
-        started = time.monotonic()
-        with self.assertRaises(socket.timeout):
-            sock.recv(1)
-        self.assertLess(time.monotonic() - started, 1.5)
-
-    def test_create_connection_takes_the_same_arguments_as_the_standard_one(self):
-        """No timeout means the socket default; a source address is bound."""
-        address = self.silent()
-        sock = node_module._Deadline(5).create_connection(address)
-        self.addCleanup(sock.close)
-        self.assertEqual(sock.getpeername(), address)
-        sock = node_module._Deadline(5).create_connection(
-            address, 5, ("127.0.0.2", 0))
-        self.addCleanup(sock.close)
-        self.assertEqual(sock.getsockname()[0], "127.0.0.2")
-
-    def test_a_deadline_the_timer_ended_opens_no_socket(self):
-        deadline = node_module._Deadline(30)
-        deadline.expire()
-        address = self.silent()
+    def test_the_sockets_of_failed_attempts_are_closed(self):
+        port, live = self.live()
+        self.resolving_to(self.unopenable, self.refused, self.refused, live)
+        node = node_module.NanoNode("http://%s:%d/" % (self.HOST, port), timeout=5)
+        node.block_info(block())
         before = open_fds()
         for _ in range(20):
-            with self.assertRaises(OSError):
-                deadline.create_connection(address, 5)
-        self.assertLess(open_fds() - before, FD_SLACK)
+            node.block_info(block())
+        self.assertLess(open_fds() - before, FD_SLACK,
+                        "a failed attempt's socket was left open")
 
-    def test_expiring_cuts_a_connected_socket(self):
-        import socket
-        listener = socket.socket()
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        self.addCleanup(listener.close)
-        deadline = node_module._Deadline(30)
-        ours = deadline.create_connection(listener.getsockname(), 30)
-        self.addCleanup(ours.close)
-        theirs, _ = listener.accept()
-        self.addCleanup(theirs.close)
-        theirs.settimeout(2)
-        deadline.expire()
-        self.assertEqual(theirs.recv(1), b"")
 
-    def handshake_against(self, address, per_read, deadline, then=None):
-        """Wrap a connection to `address` the way an HTTPS request does, after
-        leaving the plain socket a ten-second timeout; return the seconds the
-        handshake took and what it raised. `then` runs 0.3 s in, alongside."""
-        import ssl
-        import threading
-        import time
-        context = node_module._BoundedContext(ssl.create_default_context(), deadline)
-        sock = deadline.create_connection(address, per_read)
-        sock.settimeout(10)
-        if then is not None:
-            threading.Timer(0.3, then).start()
-        started = time.monotonic()
-        try:
-            tls = context.wrap_socket(sock, server_hostname="127.0.0.1")
-        except OSError as exc:
-            return time.monotonic() - started, exc
-        finally:
-            sock.close()
-        tls.close()
-        return time.monotonic() - started, None
+class NoResourceWarnings(ScriptedNode, unittest.TestCase):
+    """Every way an RPC ends closes what it opened."""
 
-    def test_a_handshake_waits_only_for_the_per_read_timeout(self):
-        took, raised = self.handshake_against(self.silent(), 0.3, node_module._Deadline(30))
-        self.assertIsInstance(raised, OSError)
-        self.assertLess(took, 1.5)
-
-    def test_expiring_cuts_a_handshake_in_progress(self):
-        """The TLS socket is watched before its handshake starts."""
-        deadline = node_module._Deadline(30)
-        took, raised = self.handshake_against(self.silent(), 30, deadline, deadline.expire)
-        self.assertIsInstance(raised, OSError)
-        self.assertLess(took, 1.5)
-
-    def test_a_failed_handshake_is_raised_by_wrap_socket_and_closed(self):
+    def test_no_resource_warning_on_any_ending(self):
         import gc
         import warnings
-        import socket
-        import threading
-        listener = socket.socket()
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(8)
-        self.addCleanup(listener.close)
-
-        def answer_garbage():
-            while True:
-                try:
-                    conn, _ = listener.accept()
-                except OSError:
-                    return
-                with conn:
-                    conn.sendall(b"this is not TLS\r\n" * 4)
-        threading.Thread(target=answer_garbage, daemon=True).start()
-        address = listener.getsockname()
+        body = self.reply()
+        ok = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+              b"Content-Length: %d\r\n\r\n" % len(body)) + body
+        scripts = [
+            [(0, ok)],
+            [(0, b"HTTP/1.1 500 Oops\r\nContent-Length: 2\r\n\r\n{}")],
+            [(0, b"HTTP/1.1 302 Found\r\nLocation: ftp://127.0.0.1/x\r\n"
+                 b"Connection: close\r\n\r\n")],
+            [(0, b"this is not HTTP\r\n\r\n")],
+            [(0, b"HTTP/1.0 200 OK\r\n\r\n[[[[" + b"[" * 100000)],
+        ]
         with warnings.catch_warnings(record=True) as seen:
             warnings.simplefilter("always", ResourceWarning)
-            for _ in range(5):
-                _, raised = self.handshake_against(address, 5, node_module._Deadline(30))
-                self.assertIsInstance(raised, OSError)
+            for steps in scripts:
+                try:
+                    self.serve_script(steps, timeout=5).block_info(block())
+                except node_module.NodeError:
+                    pass
             gc.collect()
-        self.assertEqual([w for w in seen if issubclass(w.category, ResourceWarning)], [])
-
-    def test_a_deadline_that_passed_before_connecting_says_so_in_the_same_words(self):
-        """The name lookup is not bounded; when it outlasts the deadline, the
-        hold reads as every other late reply does, whether or not the timer
-        has run yet."""
-        import socket
-        import time
-        from unittest import mock
-        real = socket.getaddrinfo
-
-        def slow(*args, **kwargs):
-            time.sleep(0.4)
-            return real(*args, **kwargs)
-
-        class Idle:
-            daemon = False
-
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def start(self):
-                pass
-
-            def cancel(self):
-                pass
-
-        node = node_module.NanoNode("http://127.0.0.1:9/", timeout=0.2)
-        for timer in (Idle, node_module.threading.Timer):
-            with self.subTest(timer=timer.__name__):
-                with mock.patch.object(socket, "getaddrinfo", slow), \
-                        mock.patch.object(node_module.threading, "Timer", timer):
-                    with self.assertRaises(node_module.NodeError) as caught:
-                        node.block_info(block())
-                self.assertIn("did not finish answering block_info within 0.2 seconds",
-                              str(caught.exception))
+        self.assertEqual([str(w.message) for w in seen
+                          if issubclass(w.category, ResourceWarning)], [])
 
 
-class TheTimerAlone(NodeStubs, unittest.TestCase):
-    """The deadline has two bounds that back each other up: every wait is
-    given only the time left, and a timer shuts every connection down when
-    it is up. Here the first is lifted - every wait is given four times the
-    timeout - so each test shows the timer alone still ends the RPC."""
-
-    TIMEOUT = ANodeThatTrickles.TIMEOUT
-    serve_script = ANodeThatTrickles.serve_script
-    whole_request = staticmethod(ANodeThatTrickles.whole_request)
-    assert_cut_in_time = ANodeThatTrickles.assert_cut_in_time
-    BODY_HEAD = EveryWayAReplyCanArriveIsCutAtTheDeadline.BODY_HEAD
-    HELLO_DRIP = TheTimeLeftBoundsEachWait.HELLO_DRIP
-
-    def setUp(self):
-        from unittest import mock
-        patch = mock.patch.object(
-            node_module._Deadline, "wait_for", lambda self, per_read: 4 * per_read)
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def test_a_trickled_body_is_cut_by_the_timer(self):
-        steps = [(0, self.BODY_HEAD)] + [(0.25, b" " * 8)] * 40
-        self.assert_cut_in_time(self.serve_script(steps))
-
-    def test_a_complete_reply_on_a_held_connection_is_cut_by_the_timer_and_not_read(self):
-        """The shutdown ends the read as if the reply had ended, and what
-        arrived parses; it is still a hold, because the time ran out."""
-        steps = [(0, b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n"
-                  + self.reply()), (10, b"")]
-        self.assert_cut_in_time(self.serve_script(steps))
-
-    def test_a_dripping_tunnel_then_server_hello_is_cut_by_the_timer(self):
-        from unittest import mock
-        reply = b"HTTP/1.1 200 Connection established\r\nX-Pad: " + b"a" * 40 + b"\r\n\r\n"
-        step = 0.8 * self.TIMEOUT / len(reply)
-        proxy = self.serve_script([(step, bytes([b])) for b in reply] + self.HELLO_DRIP)
-        env = {key: proxy.url for key in ("https_proxy", "HTTPS_PROXY")}
-        env.update(no_proxy="", NO_PROXY="")
-        with mock.patch.dict(os.environ, env):
-            node = node_module.NanoNode("https://node.invalid:7076/", timeout=self.TIMEOUT)
-            self.assert_cut_in_time(node)
-
-
-class ANodeAnsweringAnHTTPError(NodeStubs, unittest.TestCase):
+class ANodeAnsweringAnHTTPError(ScriptedNode, unittest.TestCase):
     """A plain 500 or 404 from the node is a 503 hold. Without
     HTTPDefaultErrorHandler in the opener the error response fell through
     unhandled and a TypeError escaped `rpc`."""
-
-    serve_script = ANodeThatTrickles.serve_script
-    whole_request = staticmethod(ANodeThatTrickles.whole_request)
 
     def test_the_connection_is_closed_when_the_rpc_ends(self):
         """The error reply is held by the exception that reports it, and its

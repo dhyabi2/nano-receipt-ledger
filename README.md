@@ -117,28 +117,18 @@ conversation.
   carrying an `error` field — including a rate limit or other transient refusal —
   is **not** in this list: it is still answered `404 block_not_found`. Nothing is
   written then either, but the code does not say "retry".
-- The node **timeout** (10 seconds) is one deadline for the whole RPC, measured
-  from the moment the request starts, not a limit on each socket read. It covers,
-  together and across any redirects: each TCP connect attempt (every address the
-  node's name resolves to is tried in turn, as the standard library does, and an
-  address that cannot be opened or connected is skipped), an HTTPS proxy's
-  `CONNECT` reply, the TLS handshake, sending the request, the status line, the
-  headers and the body. At the deadline every connection the RPC opened is shut
-  down, the TLS one included while its handshake is still running, and each
-  connect attempt, the handshake and each read also waits at most for the time
-  that is left. A node that keeps
-  sending a few bytes at a time is cut off when the time is up, and that is the
-  same `503 node_unavailable` hold, even if what had arrived so far happened to
-  parse; so is a reply whose connection is held open after its last byte. A
-  deadline that runs out before a connect is even attempted is reported in the
-  same words as one that runs out mid-reply ("did not finish answering
-  block_info within N seconds"). The one step it does not bound is the **name
-  lookup** of the node's (or proxy's) host: the system resolver cannot be
-  interrupted without a thread of its own, so a resolver that hangs holds the
-  request for as long as it takes, and the hold is reported only once it
-  returns. A redirect is followed only to `http` or `https`; one to `ftp`,
-  `file`, `data` or any other scheme is refused at once as the same hold. A
-  node that answers with an HTTP error status (a 500, a 404) is the same hold.
+- The node **timeout** (10 seconds) applies to each connect attempt and each
+  read, as on `main`; it is not a deadline for the whole RPC. Every address the
+  node's name resolves to is tried in turn by the standard library, each attempt
+  getting the full timeout, so an unopenable or unresponsive first address falls
+  back to the next one. A node that goes silent for longer than the timeout is
+  the same `503 node_unavailable` hold. A node that keeps trickling bytes, each
+  arriving inside the timeout, can hold a request for longer than the timeout;
+  this is unchanged from `main`, and the size cap above still bounds how much it
+  can send. A redirect is followed only to `http` or `https`; one to `ftp`,
+  `file`, `data` or any other scheme is refused at once as the same hold. A node
+  that answers with an HTTP error status (a 500, a 404) is the same hold.
+  Proxies and certificate verification behave as with the standard `urlopen`.
 - A node value echoed into a `409 block_mismatch` detail (`subtype`,
   `destination`, `amount`) is shown exactly when it is a string of up to 128
   characters, so any Nano address (65 characters as `nano_`, 64 as `xrb_`) is shown
@@ -182,7 +172,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 160 unit tests
+python3 -m unittest discover -s tests -v   # 139 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

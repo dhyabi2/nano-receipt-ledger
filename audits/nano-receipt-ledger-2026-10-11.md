@@ -8,7 +8,7 @@ dropped mid-request.
 Baseline on `009f4de`: `python3 -m pytest -q` **75 passed, 7 subtests**,
 `python3 e2e_check.py` **23/23**. On this branch after the first fix: **78
 passed, 12 subtests**, **23/23**, `python3 -m compileall ledger serve.py` clean.
-After the follow-up fixes below: `python3 -m unittest discover -s tests` **83
+After the follow-up fixes below: `python3 -m unittest discover -s tests` **139
 tests OK**, `python3 e2e_check.py` **23/23**.
 
 ## What I checked
@@ -227,6 +227,7 @@ unless it says otherwise.
   The README says the timeout covers the whole reply (`ANodeThatTrickles`: the
   body and header trickle tests take ten seconds or more on `c4843ed` and fail
   their time bound; a slow reply that finishes in time is still read).
+  **Later removed; see "The total deadline was removed" below.**
 - **Limits pinned by tests (these pass on `c4843ed`; they kill mutants that
   survived before).** `linked` of exactly 16 levels is stored and 17 is
   `400 bad_linked`, counted both as nested objects and as lists inside the
@@ -245,6 +246,39 @@ unless it says otherwise.
   are unchanged.
 
 The README's unit-test count moved 107 → 120.
+
+## The total deadline was removed
+
+The one-total-deadline transport in `ledger/node.py` (its own
+`create_connection`, a `_Deadline` timer, `_PlainSocket`/`_TLSSocket`,
+`_BoundedContext` and `release()`) was taken out again. It was added for a low
+issue `main` also has — a node trickling bytes can hold a request — and it
+produced a regression in three review rounds in a row. The last one: a first
+resolved address that silently drops packets used up the whole shared budget,
+so the working IPv4 address after it was never tried; `main`, with
+`socket.create_connection` and a timeout per attempt, succeeded in about ten
+seconds where the branch always answered 503. It was also slower under load
+(12 to 20 of 50 concurrent attaches to a slow node timed out, none on `main`),
+started a timer thread per RPC, and no longer honoured `install_opener`.
+
+`rpc` now uses the standard `http.client` connections through urllib with
+`timeout=self.timeout`, which bounds each connect attempt and each read as on
+`main`, with the standard TLS context. A node that keeps trickling bytes can
+still hold a request longer than the timeout; that is unchanged from `main`,
+and the README says so. Everything else this branch fixed stays: an unreadable
+`contents` is a NodeError, the reply is read only up to `MAX_REPLY_BYTES` + 1,
+RecursionError, ValueError, OSError and `http.client.HTTPException` are the 503
+hold, and redirects are followed only to http and https. The opener is built
+from the standard handlers without the FTP, file and data ones (proxy, unknown,
+HTTP, HTTPS, default error, redirect and error processor), so proxies and
+certificate verification behave as on `main`; because it is built per call,
+`install_opener` is still not consulted. An HTTP error reply is closed when the
+RPC ends. Tests that exercised only the removed machinery were deleted; tests
+for the redirect refusal, HTTP 500 and 404, the size cap, the HTTPException
+cases, falling back across addresses (an unopenable `::1` then a live
+127.0.0.1, and a blackholed first address then a live one within about twice
+the timeout) and the absence of ResourceWarnings remain or were added. The
+README's unit-test count moved 160 → 139.
 
 ## Also checked, found clean
 
