@@ -13,7 +13,7 @@ import secrets
 
 import nanoaddr
 from errors import LedgerError
-from money import AmountError, format_xno, parse_xno
+from money import MAX_RAW, AmountError, format_xno, parse_xno
 
 KINDS = ("grant", "work_settlement", "tip", "refund")
 BLOCK_HASH_RE = re.compile(r"\A[0-9A-F]{64}\Z")
@@ -55,6 +55,17 @@ def account_key(address):
     return verdict["public_key"] if verdict["valid"] else None
 
 
+# MAX_RAW (2**128 - 1) has 39 digits; no raw amount has more significant ones.
+MAX_RAW_DIGITS = len(str(MAX_RAW))
+# The longest node-supplied text a refusal's detail echoes back in full. A
+# Nano address is 64 or 65 characters (`xrb_` or `nano_` and 60 more), and a
+# refusal that names the wrong destination has to show the whole of it: an
+# earlier limit of 64 clipped every `nano_` address by its last character, so
+# the one field a payer needs to read back was the one that was cut. 128
+# echoes any real address, amount or subtype exactly and still clips junk.
+MAX_SHOWN = 128
+
+
 def raw_amount(value):
     """`value` as an integer of raw, or None if it does not spell one.
 
@@ -66,11 +77,76 @@ def raw_amount(value):
     have to be ASCII for that promise to hold - `"\u00b2".isdigit()` is True and
     `int("\u00b2")` raises, so `isdigit` alone would let a ValueError escape a
     money comparison.
+
+    The length is bounded for the same promise. `int()` refuses a string of
+    more than 4300 digits with ValueError (Python's integer-digit limit), and
+    a node reply carrying `"amount": "9" * 5000` raised it out of
+    `attach_block` and dropped the caller's connection. A Nano raw amount is
+    at most 2**128 - 1, which is 39 significant digits; leading zeros are
+    still read as before, and anything with more significant digits is not an
+    amount any block can carry, so it comes back as None and is refused.
     """
-    text = str(value).strip()
+    try:
+        text = str(value).strip()
+    except ValueError:
+        # str() of an int past the digit limit raises too.
+        return None
     if not text or not text.isascii() or not text.isdigit():
         return None
-    return int(text)
+    # int() counts leading zeros toward its digit limit, so they go first.
+    significant = text.lstrip("0") or "0"
+    if len(significant) > MAX_RAW_DIGITS:
+        return None
+    amount = int(significant)
+    return amount if amount <= MAX_RAW else None
+
+
+# How deeply `linked` may nest. A job id or a URL needs one level.
+MAX_LINKED_DEPTH = 16
+
+
+def _depth(value):
+    """How many levels of lists and objects `value` nests, without recursing."""
+    deepest = 0
+    pending = [(value, 1)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, dict):
+            children = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        deepest = max(deepest, level)
+        if deepest > MAX_LINKED_DEPTH:
+            return deepest
+        pending.extend((child, level + 1) for child in children)
+    return deepest
+
+
+def _shown_value(value):
+    """A node-supplied `subtype` or `destination`, as a refusal's detail shows it.
+
+    The node's answer is echoed back into a 409, and the node's answer is
+    whatever the far end sent. A `subtype` or `link_as_account` nested a
+    thousand lists deep parsed on Python 3.12 and then made `json.dumps` raise
+    RecursionError while the refusal was being written, which dropped the
+    caller's connection. Only a string or None is echoed as itself; anything
+    else is named by its type. A string of more than MAX_SHOWN characters is
+    clipped to its first MAX_SHOWN, followed by "... (N characters)" giving
+    its full length.
+
+    The node's `amount` is shown the same way. It used to be passed through
+    `str()`, so a non-string amount was shown as its text rather than named,
+    and an integer past Python's digit limit needed a special case of its own.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "<a %s, not a string>" % type(value).__name__
+    if len(value) > MAX_SHOWN:
+        return "%s... (%d characters)" % (value[:MAX_SHOWN], len(value))
+    return value
 
 
 class Ledger:
@@ -116,6 +192,15 @@ class Ledger:
         linked = body.get("linked", {}) or {}
         if not isinstance(linked, dict):
             raise LedgerError(400, "bad_linked", "'linked' must be an object")
+        if _depth(linked) > MAX_LINKED_DEPTH:
+            # Stored and echoed as given, so it has to be writable as JSON. On
+            # Python 3.12 and 3.13 a `linked` nested ~1000 deep parsed, was
+            # appended, and then made `json.dump` raise RecursionError in
+            # `Store.flush`: the caller's connection was dropped and the
+            # receipt existed in memory but not on disk.
+            raise LedgerError(
+                400, "bad_linked",
+                "'linked' is nested more than %d levels deep" % MAX_LINKED_DEPTH)
 
         receipt = {
             "id": new_receipt_id(),
@@ -180,7 +265,7 @@ class Ledger:
                 # A confirmed receive on our own chain pays nobody. This check
                 # exists because nano-settlement-verify shipped without it.
                 mismatches["subtype"] = {
-                    "expected": "send", "got": block_info.get("subtype")}
+                    "expected": "send", "got": _shown_value(block_info.get("subtype"))}
             paid = account_key(block_info.get("destination"))
             owed = account_key(receipt["counterparty_address"])
             if paid is None or owed is None or paid != owed:
@@ -188,13 +273,13 @@ class Ledger:
                 # destination is rejected exactly as it was before.
                 mismatches["destination"] = {
                     "expected": receipt["counterparty_address"],
-                    "got": block_info.get("destination"),
+                    "got": _shown_value(block_info.get("destination")),
                 }
             got_raw = raw_amount(block_info.get("amount_raw"))
             want_raw = raw_amount(receipt["amount_raw"])
             if got_raw is None or want_raw is None or got_raw != want_raw:
                 mismatches["amount"] = {
-                    "expected": receipt["amount_raw"], "got": str(block_info.get("amount_raw"))}
+                    "expected": receipt["amount_raw"], "got": _shown_value(block_info.get("amount_raw"))}
             if mismatches:
                 raise LedgerError(
                     409, "block_mismatch",

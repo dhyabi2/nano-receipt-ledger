@@ -25,7 +25,7 @@ import node as node_module  # noqa: E402
 from app import Application, ROUTES, make_server, tokens_match  # noqa: E402
 from core import Ledger  # noqa: E402
 from errors import LedgerError  # noqa: E402
-from money import format_xno, parse_xno  # noqa: E402
+from money import AmountError, format_xno, parse_xno  # noqa: E402
 from store import Store  # noqa: E402
 
 TOKEN = "test-token-not-a-real-one"
@@ -624,6 +624,115 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
             proxy.shutdown()
             proxy.server_close()
 
+    def test_a_node_that_ignores_json_block_is_a_503_not_a_dropped_connection(self):
+        """`contents` as an opaque string crashed `normalise` with AttributeError.
+
+        `block_info` is asked with `json_block: "true"`, and a node that honours
+        it answers `contents` as an object. An endpoint that ignores the flag
+        answers it as a JSON *string* instead - the same class of behaviour this
+        repository's sibling records first-hand of `rpc.nano.to`, which silently
+        ignores `raw: "true"` on `account_history`. `normalise` then ran
+        `"...".get("link_as_account")`:
+
+            AttributeError: 'str' object has no attribute 'get'
+
+        raised outside `rpc`'s own `except (OSError, ValueError)`, so it went
+        past `Handler._dispatch` (LedgerError only) exactly as the transport
+        exception above used to, and the agent proving its XNO settlement got
+        its connection closed with no HTTP response at all.
+
+        It must be a hold, not a verdict: nothing was read, so nothing is known
+        about the block. That is what `NodeError` and 503 `node_unavailable`
+        mean here, and `node.py`'s own docstring says so - "it says the node did
+        not answer, never that a block is bad".
+        """
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class IgnoresJsonBlock(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.dumps({
+                    "block_account": SELLER,
+                    "amount": str(XNO // 100),
+                    "confirmed": "true",
+                    "subtype": "send",
+                    # A real node asked without json_block answers this as a
+                    # string. Here the flag was sent and ignored.
+                    "contents": json.dumps({"type": "state",
+                                            "link_as_account": SELLER}),
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        endpoint = HTTPServer(("127.0.0.1", 0), IgnoresJsonBlock)
+        threading.Thread(target=endpoint.serve_forever, daemon=True).start()
+        try:
+            node = node_module.NanoNode(
+                "http://127.0.0.1:%d" % endpoint.server_address[1], timeout=5)
+            with self.assertRaises(node_module.NodeError):
+                node.block_info(block())
+
+            application = Application(store=Store(), node=node, token=TOKEN, clock=Clock())
+            _, receipt = application.handle(
+                "POST", "/v1/receipts", {}, {"X-Ledger-Token": TOKEN}, {
+                    "kind": "work_settlement", "counterparty": "arion",
+                    "counterparty_address": SELLER, "amount_xno": "0.010000",
+                    "reason": "delivered the extraction job"})
+            with self.assertRaises(LedgerError) as caught:
+                application.handle(
+                    "POST", "/v1/receipts/%s/attach-block" % receipt["id"], {},
+                    {"X-Ledger-Token": TOKEN}, {"block_hash": block()})
+            self.assertEqual(caught.exception.status, 503)
+            self.assertEqual(caught.exception.code, "node_unavailable")
+
+            # And the retry the message promises is safe: nothing was written.
+            _, pending = application.handle(
+                "GET", "/v1/receipts/%s" % receipt["id"], {}, {}, None)
+            self.assertIsNone(pending["block_hash"])
+            self.assertFalse(pending["confirmed"])
+        finally:
+            endpoint.shutdown()
+            endpoint.server_close()
+
+    def test_normalise_holds_on_a_reply_whose_contents_cannot_be_read(self):
+        """The unit form of the case above, for every shape `contents` can take.
+
+        A reply that names a block and carries no readable `contents` says
+        nothing about where the money went. Refusing it as a mismatch would
+        accuse a buyer who paid; this raises instead, and the HTTP layer turns
+        it into the documented retry.
+        """
+        for contents in ('{"link_as_account": "%s"}' % SELLER, None, 7, [], "null"):
+            with self.subTest(contents=contents):
+                with self.assertRaises(node_module.NodeError):
+                    node_module.normalise({"confirmed": "true", "subtype": "send",
+                                           "amount": "1", "contents": contents})
+
+    def test_normalise_still_reads_every_answer_it_read_before(self):
+        """Control: the two shapes that worked are untouched, field for field.
+
+        A node error answer is still a not-found, and a well-formed answer still
+        yields the same five facts. The one verdict that did change is for a
+        reply with `contents` missing, null or not an object: it was a terminal
+        409 (block_unconfirmed or block_mismatch) and is now the retryable 503
+        hold above.
+        """
+        self.assertEqual(
+            node_module.normalise({"error": "Block not found"}),
+            {"found": False, "confirmed": False, "subtype": None,
+             "destination": None, "amount_raw": None})
+        self.assertEqual(
+            node_module.normalise({"confirmed": "true", "subtype": "send",
+                                   "amount": "10", "contents": {"link_as_account": SELLER}}),
+            {"found": True, "confirmed": True, "subtype": "send",
+             "destination": SELLER, "amount_raw": "10"})
+
     def test_a_send_shaped_action_still_raises_loudly(self):
         """The fix must not turn the repository's own tripwire into a 503.
 
@@ -638,6 +747,479 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
         self.assertIn("only block_info", str(caught.exception))
         with self.assertRaises(RefusesToSend):
             FakeNode().rpc({"action": "process", "block": {}})
+
+
+class NodeStubs:
+    """Helpers for running the real HTTP server against a real stub node."""
+
+    def serve_node(self, body):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Stub(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass  # the client stopped reading at its limit
+
+            def log_message(self, *args):
+                pass
+
+        stub = HTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        self.addCleanup(stub.server_close)
+        self.addCleanup(stub.shutdown)
+        return node_module.NanoNode("http://127.0.0.1:%d" % stub.server_address[1], timeout=10)
+
+    def attach_over_http(self, node):
+        """Create a receipt and attach a block through the real HTTP server,
+        and assert nothing was recorded as paid."""
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertIsNone(stored["block_hash"])
+        self.assertFalse(stored["confirmed"])
+        return status, answer
+
+    def attach_and_read_back(self, node):
+        """Create a receipt, attach a block over HTTP, return what was stored."""
+        import threading
+        application = Application(store=Store(), node=node, token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+
+        def fetch(method, path, body=None):
+            request = urllib.request.Request(
+                base + path, data=json.dumps(body).encode("utf-8"), method=method,
+                headers={"Content-Type": "application/json", "X-Ledger-Token": TOKEN})
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read().decode("utf-8"))
+
+        status, receipt = fetch("POST", "/v1/receipts", {
+            "kind": "work_settlement", "counterparty": "arion",
+            "counterparty_address": SELLER, "amount_xno": "0.010000",
+            "reason": "delivered the extraction job"})
+        self.assertEqual(status, 201, receipt)
+        # Before the fixes this raised http.client.RemoteDisconnected.
+        status, answer = fetch(
+            "POST", "/v1/receipts/%s/attach-block" % receipt["id"], {"block_hash": block()})
+        _, stored = application.handle("GET", "/v1/receipts/%s" % receipt["id"], {}, {}, None)
+        return status, answer, stored
+
+    @staticmethod
+    def reply(**over):
+        answer = {"amount": str(XNO // 100), "confirmed": "true", "subtype": "send",
+                  "contents": {"type": "state", "link_as_account": SELLER}}
+        answer.update(over)
+        return json.dumps(answer).encode("utf-8")
+
+
+class RepliesThatStillDroppedTheConnection(NodeStubs, unittest.TestCase):
+    """Three node replies that got past the guards above, each over real sockets.
+
+    Each one used to raise something neither `rpc` nor `_dispatch` catches -
+    a ValueError from `int()` past Python's 4300-digit limit, a RecursionError
+    from `json.loads` - or, for the oversized body, was read whole with no
+    bound at all. Each test runs the real ledger HTTP server against a real
+    stub node and asserts the caller gets a status and a JSON body, and that
+    no receipt is recorded as paid.
+    """
+
+    def test_an_amount_past_the_integer_digit_limit_is_refused_not_dropped(self):
+        """`"amount": "9" * 5000` made `int()` raise ValueError inside
+        `attach_block`. It is not an amount any block can carry, so it is
+        refused as a mismatch, exactly as any other unreadable amount is."""
+        status, answer = self.attach_over_http(
+            self.serve_node(self.reply(amount="9" * 5000)))
+        self.assertEqual(status, 409, answer)
+        self.assertEqual(answer["error"], "block_mismatch")
+        self.assertIn("amount", answer["detail"])
+        self.assertLess(len(answer["detail"]["amount"]["got"]), 200)
+
+    def test_raw_amount_never_raises_on_a_long_or_oversized_amount(self):
+        from core import raw_amount
+        for value in ("9" * 5000, "1" + "0" * 39, str(2 ** 128), 10 ** 40):
+            with self.subTest(value=str(value)[:20]):
+                self.assertIsNone(raw_amount(value))
+        # Padding still reads, however long, and the cap itself is an amount.
+        self.assertEqual(raw_amount("0" * 5000 + "500"), 500)
+        self.assertEqual(raw_amount(str(2 ** 128 - 1)), 2 ** 128 - 1)
+        # Zero is an amount: stripping every leading zero must not leave nothing.
+        self.assertEqual(raw_amount("0"), 0)
+        self.assertEqual(raw_amount("000"), 0)
+
+    def test_a_deeply_nested_reply_is_a_503_not_a_dropped_connection(self):
+        """`json.loads` raises RecursionError, not ValueError, on deep nesting."""
+        depth = 200000
+        node = self.serve_node(b"[" * depth + b"]" * depth)
+        with self.assertRaises(node_module.NodeError):
+            node.block_info(block())
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+        # The node answered; the message must not claim it was unreachable.
+        self.assertIn("could not be read", answer["message"])
+
+    def padded_reply(self, size):
+        """A matching, confirmed reply padded with trailing whitespace to
+        exactly `size` bytes. Whitespace keeps every prefix of the padding
+        valid JSON, so the only thing that can refuse it is the size limit."""
+        body = self.reply()
+        self.assertLess(len(body), size)
+        return body + b" " * (size - len(body))
+
+    def test_a_reply_over_the_size_limit_is_refused_unread(self):
+        """An otherwise matching, confirmed reply one byte past the limit.
+
+        Before, the whole body was read into memory with no bound and the
+        block was accepted. A block_info answer is never that large, so it is
+        a hold, not a verdict, and nothing is recorded.
+        """
+        node = self.serve_node(self.padded_reply(node_module.MAX_REPLY_BYTES + 1))
+        with self.assertRaises(node_module.NodeError):
+            node.block_info(block())
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def test_a_reply_of_exactly_the_size_limit_is_still_read(self):
+        """The limit is inclusive: MAX_REPLY_BYTES itself is an answer."""
+        node = self.serve_node(self.padded_reply(node_module.MAX_REPLY_BYTES))
+        self.assertTrue(node.block_info(block())["found"])
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertEqual(status, 200, answer)
+        self.assertTrue(stored["confirmed"])
+        self.assertEqual(stored["block_hash"], block())
+
+    def test_an_absurd_amount_xno_is_a_400_not_a_dropped_connection(self):
+        """`str(raw)` in `create` raised ValueError past the digit limit."""
+        application = Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock())
+        with self.assertRaises(LedgerError) as caught:
+            application.handle("POST", "/v1/receipts", {}, {"X-Ledger-Token": TOKEN}, {
+                "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+                "amount_xno": "9" * 4290, "reason": "why"})
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.code, "amount_out_of_range")
+
+
+class NodeValuesEchoedIntoARefusal(NodeStubs, unittest.TestCase):
+    """A node's `subtype` and `link_as_account` are echoed into a 409's detail.
+
+    They were echoed as sent. Nested a thousand lists deep, Python 3.12's
+    parser read them and `json.dumps(..., indent=2)` then raised
+    RecursionError while the refusal was being written, so the caller's
+    connection was dropped. On 3.10 and 3.11 the parse itself fails (a 503
+    hold); on 3.12 and 3.13 it is a 409 whose detail is short. Either is an
+    answer; a dropped connection is not.
+    """
+
+    def nested_reply(self, field, depth):
+        answer = {"amount": str(XNO // 100), "confirmed": "true", "subtype": "send",
+                  "contents": {"type": "state", "link_as_account": SELLER}}
+        marker = '"__NESTED__"'
+        if field == "subtype":
+            answer["subtype"] = "__NESTED__"
+        else:
+            answer["contents"]["link_as_account"] = "__NESTED__"
+        return json.dumps(answer).replace(marker, "[" * depth + "]" * depth).encode("utf-8")
+
+    def assert_answered(self, field, depth):
+        status, answer = self.attach_over_http(
+            self.serve_node(self.nested_reply(field, depth)))
+        self.assertIn(status, (409, 503), answer)
+        if status == 503:
+            self.assertEqual(answer["error"], "node_unavailable")
+        else:
+            self.assertEqual(answer["error"], "block_mismatch")
+            shown = answer["detail"][field]["got"]
+            self.assertIsInstance(shown, str)
+            self.assertLess(len(shown), 200)
+
+    def test_a_nested_destination_1000_deep_is_answered(self):
+        self.assert_answered("destination", 1000)
+
+    def test_a_nested_destination_5000_deep_is_answered(self):
+        self.assert_answered("destination", 5000)
+
+    def test_a_nested_subtype_1000_deep_is_answered(self):
+        self.assert_answered("subtype", 1000)
+
+    def test_a_nested_subtype_5000_deep_is_answered(self):
+        self.assert_answered("subtype", 5000)
+
+    def test_echoed_node_values_are_short_strings(self):
+        from core import _shown_value
+        self.assertIsNone(_shown_value(None))
+        self.assertEqual(_shown_value("receive"), "receive")
+        self.assertLess(len(_shown_value("x" * 100000)), 200)
+        self.assertEqual(_shown_value([[[]]]), "<a list, not a string>")
+        self.assertEqual(_shown_value({"a": 1}), "<a dict, not a string>")
+        self.assertEqual(_shown_value(10 ** 5000), "<a int, not a string>")
+        app = Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock())
+        receipt = app.ledger.create({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why"})
+        info = {"found": True, "confirmed": True, "subtype": "x" * 5000,
+                "destination": [[["deep"]]], "amount_raw": str(XNO)}
+        with self.assertRaises(LedgerError) as caught:
+            app.ledger.attach_block(receipt["id"], block(), info)
+        detail = caught.exception.detail
+        self.assertLess(len(detail["subtype"]["got"]), 200)
+        self.assertEqual(detail["destination"]["got"], "<a list, not a string>")
+
+
+class AnAnswerThatCannotBeWritten(unittest.TestCase):
+    """Whatever the answer is, the caller gets a status line and a JSON body.
+
+    `Handler._send` called `json.dumps` unguarded. Anything it could not encode
+    - nested past the recursion limit, circular, or of a type JSON has no
+    spelling for - raised out of the handler and closed the connection.
+    """
+
+    def serve(self, payload):
+        import threading
+
+        class Returns(Application):
+            def handle(self, method, path, query, headers, body):
+                return 200, payload
+
+        application = Returns(store=Store(), node=None, token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/v1/receipts" % server.server_address[1],
+                    timeout=30) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read().decode("utf-8"))
+
+    def assert_500(self, payload):
+        status, answer = self.serve(payload)
+        self.assertEqual(status, 500, answer)
+        self.assertEqual(answer["error"], "unencodable_response")
+
+    def test_a_payload_nested_past_the_recursion_limit_is_a_500(self):
+        deep = []
+        for _ in range(100000):
+            deep = [deep]
+        self.assert_500({"detail": deep})
+
+    def test_a_circular_payload_is_a_500(self):
+        loop = {}
+        loop["self"] = loop
+        self.assert_500(loop)
+
+    def test_a_payload_json_cannot_spell_is_a_500(self):
+        self.assert_500({"value": object()})
+
+    def test_a_request_body_nested_too_deeply_is_a_400(self):
+        import threading
+        application = Application(store=Store(), node=None, token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        body = b"[" * 200000 + b"]" * 200000
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/receipts" % server.server_address[1],
+            data=body, method="POST",
+            headers={"Content-Type": "application/json", "X-Ledger-Token": TOKEN})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                status, answer = response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            status, answer = error.code, json.loads(error.read())
+        self.assertEqual(status, 400, answer)
+        self.assertEqual(answer["error"], "bad_json")
+
+
+class ADeeplyNestedLinked(unittest.TestCase):
+    """A caller's `linked` is stored and echoed; it must be writable as JSON.
+
+    On 3.12 and 3.13 a `linked` nested 1500 deep parsed, was appended to the
+    ledger, and then made `Store.flush` raise RecursionError: the connection
+    was dropped and the receipt was in memory but not on disk.
+    """
+
+    def test_it_is_refused_before_anything_is_written(self):
+        import threading
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        store = Store(os.path.join(directory, "ledger.json"))
+        application = Application(store=store, node=None, token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        body = json.dumps({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why", "linked": {"x": "__NESTED__"},
+        }).replace('"__NESTED__"', "[" * 1500 + "]" * 1500).encode("utf-8")
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/receipts" % server.server_address[1],
+            data=body, method="POST",
+            headers={"Content-Type": "application/json", "X-Ledger-Token": TOKEN})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                status, answer = response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            status, answer = error.code, json.loads(error.read())
+        self.assertEqual(status, 400, answer)
+        # bad_json on 3.10/3.11, whose parser gives up first; bad_linked after.
+        self.assertIn(answer["error"], ("bad_json", "bad_linked"))
+        self.assertEqual(store.receipts(), [])
+
+    def test_a_shallow_linked_is_still_stored(self):
+        application = Application(store=Store(), node=None, token=TOKEN, clock=Clock())
+        receipt = application.ledger.create({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why",
+            "linked": {"job_id": "job-1", "refs": [{"a": [1, 2]}]}})
+        self.assertEqual(receipt["linked"]["refs"], [{"a": [1, 2]}])
+        with self.assertRaises(LedgerError) as caught:
+            deep = []
+            for _ in range(40):
+                deep = [deep]
+            application.ledger.create({
+                "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+                "amount_xno": "1", "reason": "why", "linked": {"x": deep}})
+        self.assertEqual(caught.exception.code, "bad_linked")
+
+
+class AReplyThatIsNotHTTP(NodeStubs, unittest.TestCase):
+    """Replies http.client itself refuses, written byte for byte on a raw socket.
+
+    Each raises an http.client.HTTPException subclass - BadStatusLine,
+    LineTooLong, HTTPException("got more than 100 headers"), IncompleteRead -
+    and none of those is an OSError or a ValueError, so each went past `rpc`'s
+    guard and dropped the caller's connection. Each is a reply that could not
+    be read: a 503 hold, with nothing written.
+    """
+
+    def serve_raw(self, raw):
+        import socket
+        import threading
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        self.addCleanup(listener.close)
+
+        def loop():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                try:
+                    conn.settimeout(5)
+                    data = b""
+                    while b"\r\n\r\n" not in data:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                    head, _, rest = data.partition(b"\r\n\r\n")
+                    length = 0
+                    for line in head.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            length = int(line.split(b":", 1)[1])
+                    while len(rest) < length:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        rest += chunk
+                    conn.sendall(raw)
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+
+        threading.Thread(target=loop, daemon=True).start()
+        return node_module.NanoNode(
+            "http://127.0.0.1:%d" % listener.getsockname()[1], timeout=10)
+
+    def assert_held(self, raw):
+        node = self.serve_raw(raw)
+        with self.assertRaises(node_module.NodeError):
+            node.block_info(block())
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def test_a_garbage_status_line(self):
+        self.assert_held(b"HELLO WORLD\r\n\r\n" + self.reply())
+
+    def test_a_status_code_that_is_not_a_number(self):
+        self.assert_held(b"HTTP/1.1 abc OK\r\n\r\n")
+
+    def test_a_header_line_over_64_kib(self):
+        self.assert_held(b"HTTP/1.1 200 OK\r\nX: " + b"a" * 70000 + b"\r\n\r\n" + self.reply())
+
+    def test_more_than_100_headers(self):
+        self.assert_held(b"HTTP/1.1 200 OK\r\n" + b"X: a\r\n" * 200 + b"\r\n" + self.reply())
+
+    def test_a_chunk_size_that_is_not_hex(self):
+        self.assert_held(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
+                         + self.reply())
+
+    def test_a_chunked_body_cut_short(self):
+        self.assert_held(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabc")
+
+    def test_a_well_formed_chunked_reply_is_still_read(self):
+        body = self.reply()
+        node = self.serve_raw(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                              + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
+        self.assertTrue(node.block_info(block())["confirmed"])
+
+
+class AmountXnoAtTheDoor(Base):
+    """`parse_xno` edge cases: the 128-bit ceiling, script digits, padding."""
+
+    def test_the_largest_amount_at_six_places_is_accepted(self):
+        self.assertEqual(parse_xno("340282366.920938"), 340282366920938 * 10 ** 24)
+
+    def test_one_step_past_the_ceiling_is_refused(self):
+        from money import AmountError
+        with self.assertRaises(AmountError):
+            parse_xno("340282366.920939")
+
+    def test_digits_that_are_not_ascii_are_refused(self):
+        # Arabic-Indic one, fullwidth one, an Arabic-Indic fraction, a
+        # superscript two: str.isdigit() is True for every one of them.
+        for amount in ("١", "１", "1.٥", "٠.5", "²"):
+            with self.subTest(amount=amount):
+                with self.assertRaises(LedgerError) as caught:
+                    self.create(amount_xno=amount)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.code, "amount_out_of_range")
+
+    def test_zero_padding_past_the_digit_limit_is_read_not_dropped(self):
+        self.assertEqual(parse_xno("0" * 5000 + "1"), XNO)
+        self.assertEqual(parse_xno("0" * 5000 + "1.5"), XNO + XNO // 2)
+        self.assertEqual(parse_xno("0" * 5000 + ".5"), XNO // 2)
+        receipt = self.create(amount_xno="0" * 5000 + "0.05")
+        self.assertEqual(receipt["amount_xno"], "0.050000")
+
+    def test_padding_does_not_open_a_way_round_the_other_refusals(self):
+        for amount in ("0" * 5000, "0" * 5000 + ".0", "0" * 10 + "1" + "0" * 9,
+                       "-" + "0" * 5000 + "1", "0" * 5000 + "1.0000001"):
+            with self.subTest(amount=amount[:20]):
+                with self.assertRaises(LedgerError) as caught:
+                    self.create(amount_xno=amount)
+                self.assertEqual(caught.exception.code, "amount_out_of_range")
 
 
 class OverARealSocket(unittest.TestCase):
@@ -1066,6 +1648,650 @@ class ReadmeCounts(unittest.TestCase):
 
         self.assertEqual(
             self.advertised(r"#\s*(\d+)\s+end-to-end checks"), len(calls))
+
+
+# --------------------------------------------------------------------------
+# the fourth review of the unreadable-reply fixes
+# --------------------------------------------------------------------------
+
+class AWrongDestinationIsShownWhole(Base):
+    """A 409 that says the money went elsewhere has to say where, exactly.
+
+    The echo limit was 64 characters and a `nano_` address is 65, so every
+    wrong destination came back missing its last character: the one field a
+    payer needs to compare against their own records was the one cut.
+    """
+
+    def refusal(self, destination):
+        receipt = self.create()
+        with self.assertRaises(LedgerError) as caught:
+            self.settle(receipt, destination=destination)
+        self.assertEqual(caught.exception.code, "block_mismatch")
+        return caught.exception.detail["destination"]
+
+    def test_a_wrong_nano_address_is_echoed_byte_exact(self):
+        self.assertEqual(len(OTHER), 65)
+        shown = self.refusal(OTHER)
+        self.assertEqual(shown["got"], OTHER)
+        self.assertEqual(shown["expected"], SELLER)
+
+    def test_a_wrong_xrb_address_is_echoed_byte_exact(self):
+        self.assertEqual(self.refusal(OTHER_XRB)["got"], OTHER_XRB)
+
+    def test_a_long_junk_destination_is_still_clipped(self):
+        from core import MAX_SHOWN, _shown_value
+        self.assertEqual(_shown_value("a" * MAX_SHOWN), "a" * MAX_SHOWN)
+        self.assertNotEqual(_shown_value("a" * (MAX_SHOWN + 1)), "a" * (MAX_SHOWN + 1))
+        shown = self.refusal("nano_" + "1" * 5000)["got"]
+        self.assertLess(len(shown), 200)
+        self.assertIn("5005 characters", shown)
+
+
+class APlainTextReceiptIsAlwaysAnswered(unittest.TestCase):
+    """`Accept: text/plain` on a receipt, over a real socket.
+
+    A lone surrogate is valid in a JSON string and so reaches the store, and
+    `text.encode("utf-8")` in `_send_text` raised UnicodeEncodeError on it:
+    the pasteable form of that receipt was a closed connection.
+    """
+
+    def serve(self, application):
+        import threading
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return "http://127.0.0.1:%d" % server.server_address[1]
+
+    def fetch(self, base, method, path, body=None, headers=None):
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(
+            base + path, data=data, method=method,
+            headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers
+
+    def test_a_lone_surrogate_in_a_stored_field_is_answered(self):
+        application = Application(store=Store(), node=None, token=TOKEN, clock=Clock())
+        base = self.serve(application)
+        status, body, _ = self.fetch(base, "POST", "/v1/receipts", {
+            "kind": "tip", "counterparty": "a\ud800b", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why \udfff here"}, {"X-Ledger-Token": TOKEN})
+        self.assertEqual(status, 201, body)
+        receipt_id = json.loads(body)["id"]
+        status, body, headers = self.fetch(
+            base, "GET", "/v1/receipts/%s" % receipt_id, headers={"Accept": "text/plain"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(headers["Content-Type"].startswith("text/plain"))
+        text = body.decode("utf-8")
+        self.assertIn("a\\ud800b", text)
+        self.assertIn("why \\udfff here", text)
+        # The JSON form was never affected and still round-trips the value.
+        status, body, _ = self.fetch(base, "GET", "/v1/receipts/%s" % receipt_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["counterparty"], "a\ud800b")
+
+    def test_a_plaintext_that_cannot_be_written_is_a_500(self):
+        class Unwritable(Application):
+            def plaintext(self, receipt):
+                return 42
+
+        application = Unwritable(store=Store(), node=None, token=TOKEN, clock=Clock())
+        receipt = application.ledger.create({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why"})
+        status, body, _ = self.fetch(
+            self.serve(application), "GET", "/v1/receipts/%s" % receipt["id"],
+            headers={"Accept": "text/plain"})
+        self.assertEqual(status, 500, body)
+        self.assertEqual(json.loads(body)["error"], "unencodable_response")
+
+
+class ScriptedNode(NodeStubs):
+    """A raw socket node that plays a script of (pause, bytes) steps."""
+
+    TIMEOUT = 1.0
+
+    def serve_script(self, steps, timeout=None, tls=None, scheme="http"):
+        """A raw socket node that reads the request, then sends each
+        (pause, bytes) step in turn and stops early once the client hangs up.
+        `tls` is a server-side SSLContext the connection is wrapped in."""
+        import socket
+        import threading
+        import time
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        self.addCleanup(listener.close)
+
+        def loop():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                try:
+                    conn.settimeout(5)
+                    if tls is not None:
+                        conn = tls.wrap_socket(conn, server_side=True)
+                    data = b""
+                    while not self.whole_request(data):
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                    for pause, piece in steps:
+                        time.sleep(pause)
+                        conn.sendall(piece)
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+
+        threading.Thread(target=loop, daemon=True).start()
+        return node_module.NanoNode(
+            "%s://127.0.0.1:%d" % (scheme, listener.getsockname()[1]),
+            timeout=timeout or self.TIMEOUT)
+
+    @staticmethod
+    def whole_request(data):
+        """True once the request's headers and its Content-Length of body are
+        in: over TLS they arrive as separate records, and closing with the
+        body unread resets the connection before the client reads a reply."""
+        head, found, body = data.partition(b"\r\n\r\n")
+        if not found:
+            return False
+        length = re.search(rb"(?im)^content-length:\s*(\d+)", head)
+        return len(body) >= (int(length.group(1)) if length else 0)
+
+
+
+class ANodeThatIsSlowOrLarge(ScriptedNode, unittest.TestCase):
+    """`timeout` bounds each connect attempt and each read, as on main; a
+    reply is also bounded in size."""
+
+    def test_a_slow_reply_that_finishes_in_time_is_still_read(self):
+        body = self.reply()
+        head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body))
+        steps = [(0, head), (0.1, body[:10]), (0.1, body[10:20]), (0.1, body[20:])]
+        self.assertTrue(self.serve_script(steps, timeout=5).block_info(block())["found"])
+
+    def test_a_node_that_goes_silent_is_a_503_hold_after_one_read_timeout(self):
+        import time
+        head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 100000\r\n\r\n")
+        steps = [(0, head), (10, b"")]
+        node = self.serve_script(steps)
+        started = time.monotonic()
+        with self.assertRaises(node_module.NodeError):
+            node.block_info(block())
+        self.assertLess(time.monotonic() - started, node.timeout * 3)
+        status, answer = self.attach_over_http(self.serve_script(steps))
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def test_a_node_streaming_without_end_is_cut_at_the_size_limit(self):
+        """The read stops at MAX_REPLY_BYTES + 1 and says so."""
+        import time
+        head = b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n"
+        steps = [(0, head)] + [(0, b" " * 65536)] * 1000
+        node = self.serve_script(steps, timeout=30)
+        started = time.monotonic()
+        with self.assertRaises(node_module.NodeError) as caught:
+            node.block_info(block())
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertIn("more than %d bytes" % node_module.MAX_REPLY_BYTES,
+                      str(caught.exception))
+
+    def test_the_size_limit_is_the_one_the_readme_states(self):
+        self.assertEqual(node_module.MAX_REPLY_BYTES, 1024 * 1024)
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            self.assertRegex(fh.read(), r"over\s+1\s+MiB")
+
+    def test_the_readme_says_the_timeout_is_per_attempt_and_per_read(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertRegex(text, r"each\s+connect\s+attempt\s+and\s+each\s+read")
+        self.assertNotRegex(text, r"one\s+deadline\s+for\s+the\s+whole")
+
+
+class ARedirectOrATLSReply(ScriptedNode, unittest.TestCase):
+    """Redirects are followed only to http and https; https is verified with
+    the standard context."""
+
+    def redirect(self, location):
+        return [(0, b"HTTP/1.1 302 Found\r\nLocation: " + location.encode("ascii")
+                 + b"\r\nConnection: close\r\n\r\n")]
+
+    def test_a_redirect_to_ftp_is_refused_at_once(self):
+        """`build_opener` installed an FTP handler, and a redirect to ftp://
+        was followed: a banner dripped a byte at a time held the RPC."""
+        import time
+        banner = self.serve_script([(0.25, b"2")] * 200)
+        ftp = banner.url.replace("http://", "ftp://") + "/x.json"
+        node = self.serve_script(self.redirect(ftp))
+        started = time.monotonic()
+        with self.assertRaises(node_module.NodeError) as caught:
+            node.block_info(block())
+        self.assertLess(time.monotonic() - started, node.timeout * 1.5)
+        self.assertIn("ftp", str(caught.exception))
+        status, answer = self.attach_over_http(self.serve_script(self.redirect(ftp)))
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def test_file_and_data_redirects_are_refused(self):
+        import time
+        for location in ("file:///etc/hostname", "data:application/json,{}"):
+            with self.subTest(location=location):
+                started = time.monotonic()
+                with self.assertRaises(node_module.NodeError):
+                    self.serve_script(self.redirect(location)).block_info(block())
+                self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_a_redirect_to_another_http_node_is_followed(self):
+        body = self.reply()
+        target = self.serve_script([(0, b"HTTP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n"
+                                     % len(body) + body)], timeout=5)
+        node = self.serve_script(self.redirect(target.url + "/x"), timeout=5)
+        self.assertTrue(node.block_info(block())["found"])
+
+    def tls_pair(self):
+        """A throwaway certificate authority and a certificate for 127.0.0.1
+        it signed, made for this test: (server context, CA file to trust)."""
+        import ssl
+        import subprocess
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl is needed to make a test certificate")
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, True)
+
+        def run(*args):
+            subprocess.run(("openssl",) + args, cwd=work, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        curve = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes")
+        run("req", "-x509", *curve, "-keyout", "ca.key", "-out", "ca.pem", "-days", "2",
+            "-subj", "/CN=test-only-ca", "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+        run("req", *curve, "-keyout", "srv.key", "-out", "srv.csr", "-subj", "/CN=127.0.0.1")
+        with open(os.path.join(work, "ext"), "w") as fh:
+            fh.write("subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\n"
+                     "keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n"
+                     "authorityKeyIdentifier=keyid\nsubjectKeyIdentifier=hash\n")
+        run("x509", "-req", "-in", "srv.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+            "-CAcreateserial", "-out", "srv.pem", "-days", "2", "-extfile", "ext")
+        server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server.load_cert_chain(os.path.join(work, "srv.pem"), os.path.join(work, "srv.key"))
+        return server, os.path.join(work, "ca.pem")
+
+    def trusting(self, ca_file):
+        from unittest import mock
+        patch = mock.patch.dict(os.environ, {"SSL_CERT_FILE": ca_file})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_an_https_reply_that_finishes_is_read(self):
+        server, ca_file = self.tls_pair()
+        self.trusting(ca_file)
+        body = self.reply()
+        head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body))
+        node = self.serve_script([(0, head + body)], timeout=5, tls=server, scheme="https")
+        self.assertTrue(node.block_info(block())["found"])
+
+    def test_an_https_node_with_an_untrusted_certificate_is_a_503_hold(self):
+        server, _ = self.tls_pair()
+        body = self.reply()
+        head = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body))
+        node = self.serve_script([(0, head + body)], timeout=5, tls=server, scheme="https")
+        with self.assertRaises(node_module.NodeError) as caught:
+            node.block_info(block())
+        self.assertIn("CERTIFICATE", str(caught.exception).upper())
+
+
+class TheEchoLimitAndItsClip(unittest.TestCase):
+    def test_128_characters_are_shown_whole_and_129_are_clipped(self):
+        from core import MAX_SHOWN, _shown_value
+        self.assertEqual(MAX_SHOWN, 128)
+        self.assertEqual(_shown_value("a" * 128), "a" * 128)
+        self.assertEqual(_shown_value("a" * 128 + "b"), "a" * 128 + "... (129 characters)")
+        self.assertEqual(_shown_value("a" * 1000), "a" * 128 + "... (1000 characters)")
+
+    def test_a_non_string_amount_is_named_by_its_type(self):
+        app = Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock())
+        receipt = app.ledger.create({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why"})
+        for amount, shown in ((7, "<a int, not a string>"),
+                              (10 ** 5000, "<a int, not a string>"),
+                              ([1], "<a list, not a string>"),
+                              ("9" * 200, "9" * 128 + "... (200 characters)")):
+            with self.subTest(shown=shown):
+                info = {"found": True, "confirmed": True, "subtype": "send",
+                        "destination": SELLER, "amount_raw": amount}
+                with self.assertRaises(LedgerError) as caught:
+                    app.ledger.attach_block(receipt["id"], block(), info)
+                self.assertEqual(caught.exception.detail["amount"]["got"], shown)
+
+    def test_the_readme_states_the_clip_format(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = " ".join(fh.read().split())
+        self.assertTrue("first 128 characters followed by `... (N characters)`" in readme,
+                        "the README does not state the clip format")
+
+
+class AnAmountRefusalSaysWhatIsWrong(unittest.TestCase):
+    """The shape is judged before the range, on the caller's own text."""
+
+    def refused(self, sent):
+        with self.assertRaises(AmountError) as caught:
+            parse_xno(sent)
+        return str(caught.exception)
+
+    def test_each_refusal_names_the_right_reason_and_quotes_the_text(self):
+        for sent, reason in (("abcdefghijk", "not a decimal number"),
+                             ("-0000000001", "must not be negative"),
+                             ("-1", "must not be negative"),
+                             ("00-1", "not a decimal number"),
+                             ("1.2.3", "not a decimal number"),
+                             ("+1", "not a decimal number"),
+                             (".", "not a decimal number"),
+                             ("", "empty"),
+                             ("0", "greater than zero"),
+                             ("0.0000001", "7 decimal places"),
+                             ("340282366.920939", "2**128 - 1"),
+                             ("9" * 30, "2**128 - 1"),
+                             ("\u0661", "ASCII")):
+            with self.subTest(sent=sent):
+                message = self.refused(sent)
+                self.assertIn(reason, message)
+                self.assertIn(repr(sent), message)
+
+    def test_the_quoted_text_is_clipped_at_40_characters(self):
+        self.assertIn(repr("x" * 40), self.refused("x" * 40))
+        message = self.refused("x" * 41)
+        self.assertIn(repr("x" * 40 + "..."), message)
+        self.assertNotIn("x" * 41, message)
+        message = self.refused("0" * 5000 + "-1")
+        self.assertIn(repr("0" * 40 + "..."), message)
+        self.assertLess(len(message), 200)
+
+    def test_well_formed_amounts_still_parse(self):
+        for sent, raw in (("1", XNO), (".5", XNO // 2), ("1.", XNO),
+                          (" 0001.250000 ", XNO * 5 // 4),
+                          ("0" * 5000 + "1", XNO),
+                          ("340282366.920938", 340282366920938 * 10 ** 24)):
+            with self.subTest(sent=sent[:20]):
+                self.assertEqual(parse_xno(sent), raw)
+
+
+class TheLinkedDepthLimit(Base):
+    """`linked` may nest exactly MAX_LINKED_DEPTH (16) levels; the 17th is refused.
+
+    The object `linked` itself is level one, and a list counts as a level
+    exactly as an object does.
+    """
+
+    def create_linked(self, linked):
+        return self.call("POST", "/v1/receipts", {
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why", "linked": linked}, token=TOKEN)
+
+    @staticmethod
+    def objects(depth):
+        value = "x"
+        for _ in range(depth):
+            value = {"k": value}
+        return value
+
+    @staticmethod
+    def lists_inside_an_object(depth):
+        value = "x"
+        for _ in range(depth - 1):
+            value = [value]
+        return {"k": value}
+
+    def assert_limit(self, build):
+        from core import MAX_LINKED_DEPTH
+        self.assertEqual(MAX_LINKED_DEPTH, 16)
+        status, receipt = self.create_linked(build(16))
+        self.assertEqual(status, 201, receipt)
+        with self.assertRaises(LedgerError) as caught:
+            self.create_linked(build(17))
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.code, "bad_linked")
+
+    def test_sixteen_objects_deep_is_stored_and_seventeen_refused(self):
+        self.assert_limit(self.objects)
+
+    def test_lists_inside_linked_count_as_levels(self):
+        self.assert_limit(self.lists_inside_an_object)
+
+
+class AnAmountErrorQuotesTheCallersText(unittest.TestCase):
+    def test_the_refusal_quotes_what_was_sent_not_what_was_stripped(self):
+        for sent in (" 0x1", "00x1", "0001.2.3"):
+            with self.subTest(sent=sent):
+                with self.assertRaises(AmountError) as caught:
+                    parse_xno(sent)
+                self.assertIn(repr(sent), str(caught.exception))
+
+
+# --------------------------------------------------------------------------
+# the transport is the standard one again
+# --------------------------------------------------------------------------
+
+def open_fds():
+    return len(os.listdir("/proc/self/fd"))
+
+
+# Other tests' stub servers close their sockets on their own threads, so the
+# count moves by a few on its own; a leak in the loops below is 20 or more.
+FD_SLACK = 5
+
+
+class EveryAddressIsTried(NodeStubs, unittest.TestCase):
+    """Each address the name resolves to is tried in turn, by the standard
+    `socket.create_connection`, with the timeout applying to each attempt.
+
+    A replacement transport tried here once shared one budget across all
+    attempts: an address family the host cannot open (`::1` on a host with
+    IPv6 turned off) ended the RPC, and a first address that silently drops
+    packets used up the whole budget so the working one was never tried.
+    """
+
+    HOST = "several.addresses.test"
+
+    def setUp(self):
+        import socket
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("counting open descriptors needs /proc/self/fd")
+        # Family 255 is no address family at all: socket() fails with
+        # EAFNOSUPPORT on every host, as AF_INET6 does on one without IPv6.
+        self.unopenable = (255, socket.SOCK_STREAM, 6, "", ("::1", 1))
+        spare = socket.socket()
+        spare.bind(("127.0.0.1", 0))
+        self.refused = (socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                        ("127.0.0.1", spare.getsockname()[1]))
+        spare.close()
+
+    def resolving_to(self, *addresses):
+        import socket
+        from unittest import mock
+        real = socket.getaddrinfo
+
+        def fake(host, port, *args, **kwargs):
+            if host == self.HOST:
+                return list(addresses)
+            return real(host, port, *args, **kwargs)
+        patch = mock.patch.object(socket, "getaddrinfo", fake)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def live(self):
+        import socket
+        node = self.serve_node(self.reply())
+        port = int(node.url.rsplit(":", 1)[1])
+        return port, (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))
+
+    def test_an_unopenable_then_a_refused_address_falls_back_to_a_live_one(self):
+        port, live = self.live()
+        self.resolving_to(self.unopenable, self.refused, live)
+        node = node_module.NanoNode("http://%s:%d/" % (self.HOST, port), timeout=5)
+        self.assertTrue(node.block_info(block())["found"])
+
+    def test_when_every_address_fails_it_is_a_503_hold(self):
+        self.resolving_to(self.unopenable, self.refused)
+        node = node_module.NanoNode("http://%s:7076/" % self.HOST, timeout=5)
+        with self.assertRaises(node_module.NodeError) as caught:
+            node.block_info(block())
+        self.assertIn("refused", str(caught.exception).lower())
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def blackhole(self):
+        """A loopback address whose connects hang: its accept queue is full
+        and never drained, so every further SYN is dropped."""
+        import socket
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(0)
+        self.addCleanup(listener.close)
+        address = listener.getsockname()
+        for _ in range(8):
+            probe = socket.socket()
+            probe.settimeout(0.2)
+            try:
+                probe.connect(address)
+            except OSError:
+                probe.close()
+                return address
+            self.addCleanup(probe.close)
+        self.skipTest("this host does not drop connects to a full accept queue")
+
+    def test_a_blackholed_first_address_then_a_live_one_succeeds(self):
+        """The first attempt times out after `timeout`, then the live address
+        answers: within about twice the timeout, as on main."""
+        import socket
+        import time
+        host, dropped = self.blackhole()
+        port, live = self.live()
+        self.resolving_to(
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, dropped)), live)
+        node = node_module.NanoNode("http://%s:%d/" % (self.HOST, port), timeout=0.5)
+        started = time.monotonic()
+        self.assertTrue(node.block_info(block())["found"])
+        self.assertLess(time.monotonic() - started, 2 * node.timeout + 0.5)
+
+    def test_the_sockets_of_failed_attempts_are_closed(self):
+        port, live = self.live()
+        self.resolving_to(self.unopenable, self.refused, self.refused, live)
+        node = node_module.NanoNode("http://%s:%d/" % (self.HOST, port), timeout=5)
+        node.block_info(block())
+        before = open_fds()
+        for _ in range(20):
+            node.block_info(block())
+        self.assertLess(open_fds() - before, FD_SLACK,
+                        "a failed attempt's socket was left open")
+
+
+class NoResourceWarnings(ScriptedNode, unittest.TestCase):
+    """Every way an RPC ends closes what it opened."""
+
+    def test_no_resource_warning_on_any_ending(self):
+        import gc
+        import warnings
+        body = self.reply()
+        ok = (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+              b"Content-Length: %d\r\n\r\n" % len(body)) + body
+        scripts = [
+            [(0, ok)],
+            [(0, b"HTTP/1.1 500 Oops\r\nContent-Length: 2\r\n\r\n{}")],
+            [(0, b"HTTP/1.1 302 Found\r\nLocation: ftp://127.0.0.1/x\r\n"
+                 b"Connection: close\r\n\r\n")],
+            [(0, b"this is not HTTP\r\n\r\n")],
+            [(0, b"HTTP/1.0 200 OK\r\n\r\n[[[[" + b"[" * 100000)],
+        ]
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always", ResourceWarning)
+            for steps in scripts:
+                try:
+                    self.serve_script(steps, timeout=5).block_info(block())
+                except node_module.NodeError:
+                    pass
+            gc.collect()
+        self.assertEqual([str(w.message) for w in seen
+                          if issubclass(w.category, ResourceWarning)], [])
+
+
+class ANodeAnsweringAnHTTPError(ScriptedNode, unittest.TestCase):
+    """A plain 500 or 404 from the node is a 503 hold. Without
+    HTTPDefaultErrorHandler in the opener the error response fell through
+    unhandled and a TypeError escaped `rpc`."""
+
+    def test_the_connection_is_closed_when_the_rpc_ends(self):
+        """The error reply is held by the exception that reports it, and its
+        connection used to stay open for as long as that exception lived."""
+        import socket
+        import threading
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        seen = []
+
+        def serve():
+            conn, _ = listener.accept()
+            with conn:
+                conn.settimeout(3)
+                data = b""
+                while not self.whole_request(data):
+                    data += conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 500 Oops\r\nContent-Length: 2\r\n\r\n{}")
+                try:
+                    seen.append(conn.recv(1))
+                except OSError as exc:
+                    seen.append(exc)
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        node = node_module.NanoNode("http://127.0.0.1:%d/" % listener.getsockname()[1], 5)
+        with self.assertRaises(node_module.NodeError) as caught:
+            node.block_info(block())
+        server.join(5)
+        self.assertEqual(seen, [b""], "the connection was still open after the RPC")
+        self.assertIn("500", str(caught.exception))
+
+    def test_500_and_404_are_a_503_hold(self):
+        for status in (b"500 Oops", b"404 Not Found"):
+            with self.subTest(status=status):
+                steps = [(0, b"HTTP/1.1 " + status + b"\r\nContent-Length: 2\r\n"
+                          b"Connection: close\r\n\r\n{}")]
+                with self.assertRaises(node_module.NodeError) as caught:
+                    self.serve_script(steps, timeout=5).block_info(block())
+                self.assertIn(status.split()[0].decode(), str(caught.exception))
+                status_code, answer = self.attach_over_http(
+                    self.serve_script(steps, timeout=5))
+                self.assertEqual(status_code, 503, answer)
+                self.assertEqual(answer["error"], "node_unavailable")
+
+
+class AVeryLongWholePart(unittest.TestCase):
+    def test_5000_digits_are_refused_as_too_large_by_length(self):
+        """Refused by its length, before `int()` meets Python's 4300-digit
+        limit and the refusal names that instead of the 2**128 bound."""
+        sent = "9" * 5000
+        with self.assertRaises(AmountError) as caught:
+            parse_xno(sent)
+        message = str(caught.exception)
+        self.assertEqual(message, "amount_xno is more than the 2**128 - 1 raw any Nano "
+                         "account can hold: %r" % (sent[:40] + "...",))
+
 
 if __name__ == "__main__":
     unittest.main()

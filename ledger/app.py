@@ -140,7 +140,8 @@ class Application:
         except NodeError as exc:
             raise LedgerError(
                 503, "node_unavailable",
-                "the Nano node could not be reached, so this block was not checked and "
+                "no usable answer came from the Nano node (it could not be reached, or "
+                "its reply could not be read), so this block was not checked and "
                 "nothing was attached; the receipt is unchanged and the request can be "
                 "retried: %s" % exc) from None
         return 200, self.render(self.ledger.attach_block(params["receipt_id"], block_hash, info))
@@ -212,6 +213,36 @@ class Application:
         return "\n".join(lines[:20]) + "\n"
 
 
+def _encode(payload):
+    """`payload` as the bytes of a JSON response, or None if it cannot be one.
+
+    `json.dumps(..., indent=2)` recurses once per level of nesting and raises
+    RecursionError on a value nested deeply enough; it raises ValueError on a
+    circular reference and TypeError on a value JSON has no spelling for.
+    """
+    try:
+        return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    except (RecursionError, ValueError, TypeError):
+        return None
+
+
+def _encode_text(text):
+    """`text` as the bytes of a text/plain response, or None if it cannot be one.
+
+    A stored field can hold a lone surrogate ("\\ud800"): JSON parses one
+    happily and `_require_string` has no reason to refuse it. `_encode` writes
+    it as an escape, but a plain `text.encode("utf-8")` raised
+    UnicodeEncodeError out of `_send_text`, and `GET /v1/receipts/{id}` with
+    `Accept: text/plain` closed the connection with no status line. Such a
+    character is shown as its backslash escape instead; anything that still
+    cannot be written comes back as None, exactly as `_encode` does.
+    """
+    try:
+        return text.encode("utf-8", errors="backslashreplace")
+    except (UnicodeError, AttributeError, TypeError):
+        return None
+
+
 def _clip(text, width):
     text = " ".join(text.split())
     return text if len(text) <= width else text[:width - 1] + "…"
@@ -275,7 +306,10 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw.decode("utf-8")) if raw else None
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            # RecursionError: a body nested too deeply for the parser is not
+            # JSON this service can read, and on 3.10 and 3.11 it raised past
+            # this guard and dropped the connection.
             return self._send(400, {"error": "bad_json", "message": "body is not valid JSON"})
         try:
             status, payload = self.application.handle(
@@ -289,15 +323,34 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(status, payload)
 
     def _send(self, status, payload):
-        body = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        body = _encode(payload)
+        if body is None:
+            # The answer itself could not be written as JSON. That used to raise
+            # out of the handler and close the connection with no status line,
+            # so the caller could not tell a refusal from a crash. Say so instead.
+            return self._send_unencodable()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_unencodable(self):
+        body = _encode({
+            "error": "unencodable_response",
+            "message": "the answer to this request could not be written; "
+                       "nothing about it is reported here",
+        })
+        self.send_response(500)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_text(self, status, text):
-        body = text.encode("utf-8")
+        body = _encode_text(text)
+        if body is None:
+            return self._send_unencodable()
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
