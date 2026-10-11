@@ -89,7 +89,12 @@ def parse_xno(amount) -> int:
     try:
         raw = xno_to_raw(text)
     except ValueError as exc:
-        raise AmountError(str(exc)) from None
+        # The vendored function's message quotes the text it was handed, and
+        # by here that may be the zero-stripped text, not the caller's: " 0x1"
+        # was reported as 'x1'. Quote what the caller actually sent instead
+        # (clipped, since leading zeros can make it arbitrarily long).
+        raise AmountError(
+            str(exc).replace(repr(text), repr(_clipped(amount)), 1)) from None
     if raw <= 0:
         raise AmountError("amount_xno must be greater than zero")
     # No Nano account can hold more than 2**128 - 1 raw, so no block can pay

@@ -113,13 +113,23 @@ conversation.
   carrying an `error` field — including a rate limit or other transient refusal —
   is **not** in this list: it is still answered `404 block_not_found`. Nothing is
   written then either, but the code does not say "retry".
+- The node **timeout** (10 seconds) bounds the whole reply — connecting, the
+  status line, the headers and the body together — not each socket read. A node
+  that keeps sending a few bytes at a time is cut off when the time is up, and
+  that is the same `503 node_unavailable` hold, even if what had arrived so far
+  happened to parse.
 - A node value echoed into a `409 block_mismatch` detail (`subtype`,
-  `destination`, `amount`) is shown as a short string: a long one is clipped and
-  anything that is not a string is named by its type. If an answer still cannot be
-  written as JSON, the caller gets `500 unencodable_response` rather than a closed
-  connection. A request body nested too deeply to parse is `400 bad_json`, and a
-  `linked` object nested more than 16 levels deep is `400 bad_linked`, before
-  anything is written.
+  `destination`, `amount`) is shown as a string of at most 128 characters, so any
+  Nano address (65 characters as `nano_`, 64 as `xrb_`) is shown exactly: a
+  longer one is clipped and anything that is not a string is named by its type.
+  If an answer still cannot be written — as JSON, or as the `text/plain` form —
+  the caller gets `500 unencodable_response` rather than a closed connection. A
+  stored character UTF-8 cannot carry (a lone surrogate, which JSON allows) appears
+  in the `text/plain` form as its backslash escape.
+- A request body nested too deeply to parse is `400 bad_json`, and a `linked`
+  object nested more than 16 levels deep (`linked` itself is level one, and a list
+  counts as a level, as an object does) is `400 bad_linked`, before anything is
+  written.
 
 `paid_xno_total` counts confirmed receipts only. Pending amounts are reported
 separately and are never folded in. All arithmetic is on integer raw — 1 XNO is
@@ -149,7 +159,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 107 unit tests
+python3 -m unittest discover -s tests -v   # 120 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

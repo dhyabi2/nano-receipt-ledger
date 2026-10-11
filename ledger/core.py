@@ -57,8 +57,13 @@ def account_key(address):
 
 # MAX_RAW (2**128 - 1) has 39 digits; no raw amount has more significant ones.
 MAX_RAW_DIGITS = len(str(MAX_RAW))
-# The longest amount text a refusal's detail echoes back in full.
-MAX_SHOWN = 64
+# The longest node-supplied text a refusal's detail echoes back in full. A
+# Nano address is 64 or 65 characters (`xrb_` or `nano_` and 60 more), and a
+# refusal that names the wrong destination has to show the whole of it: an
+# earlier limit of 64 clipped every `nano_` address by its last character, so
+# the one field a payer needs to read back was the one that was cut. 128
+# echoes any real address, amount or subtype exactly and still clips junk.
+MAX_SHOWN = 128
 
 
 def raw_amount(value):

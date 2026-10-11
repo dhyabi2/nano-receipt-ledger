@@ -196,6 +196,56 @@ Telling a real not-found from a transient error needs the error strings of each
 endpoint, which this audit did not collect. The README now says so rather than
 listing every unreadable answer under the 503 hold.
 
+## Found in a third review and fixed on this branch
+
+A third review, run on `c4843ed`, found one regression the second round
+introduced and four smaller gaps. Each test named below fails on `c4843ed`
+unless it says otherwise.
+
+- **The wrong destination was shown with its last character cut off
+  (regression).** The echo limit `MAX_SHOWN` added in the second round was 64
+  characters, and a `nano_` address is 65, so every `block_mismatch` that named
+  a wrong destination clipped it — on `main` the full address was shown. The
+  limit is now 128: any `nano_` or `xrb_` address, amount or subtype is echoed
+  exactly, and longer junk is still clipped
+  (`AWrongDestinationIsShownWhole`; the `nano_` test fails on `c4843ed`, the
+  `xrb_` one, at 64 characters, passed already and pins it).
+- **`Accept: text/plain` dropped the connection on a lone surrogate
+  (pre-existing).** JSON allows `"\ud800"`, so it reaches the store; `_encode`
+  writes it as an escape, but `_send_text` called `text.encode("utf-8")`, which
+  raised UnicodeEncodeError. The plain-text form now writes such a character as
+  its backslash escape, and `_send_text` falls back to
+  `500 unencodable_response` exactly as `_send` does if its text still cannot be
+  written (`APlainTextReceiptIsAlwaysAnswered`, over a real socket; both tests
+  drop the connection on `c4843ed`).
+- **The node timeout bounded each read, not the reply.** A node sending eight
+  bytes every quarter second never let one read time out, so it held the attach
+  request for as long as it kept sending — in the body or in the headers. `rpc`
+  now arms a timer for the whole call; when it fires, the connection's socket
+  is shut down, the read in progress returns, and the call is the same
+  `503 node_unavailable` hold, even if the part that arrived would have parsed.
+  The README says the timeout covers the whole reply (`ANodeThatTrickles`: the
+  body and header trickle tests take ten seconds or more on `c4843ed` and fail
+  their time bound; a slow reply that finishes in time is still read).
+- **Limits pinned by tests (these pass on `c4843ed`; they kill mutants that
+  survived before).** `linked` of exactly 16 levels is stored and 17 is
+  `400 bad_linked`, counted both as nested objects and as lists inside the
+  object (`TheLinkedDepthLimit`; kills `MAX_LINKED_DEPTH` 15 or 17, `>=` for
+  `>`, and starting the count at 0). `MAX_REPLY_BYTES` is asserted to be the
+  1 MiB the README states, and a node streaming a body with no end is cut at
+  the size limit — the refusal names the limit and arrives long before the
+  deadline, so an unbounded read cannot pass by waiting for the timer. All
+  eleven mutants tried (the five above, `MAX_SHOWN = 64`, an unbounded read, a
+  timer that never starts, a connection the timer cannot see, a plain
+  `encode("utf-8")`, and the unquoted amount message) fail the suite.
+- **An amount refusal quoted altered text (cosmetic).** After leading zeros
+  were dropped, the vendored `xno_to_raw` quoted what it was handed, so
+  `" 0x1"` was reported as `'x1'`. `parse_xno` now quotes the caller's own
+  input, clipped (`AnAmountErrorQuotesTheCallersText`). The vendored functions
+  are unchanged.
+
+The README's unit-test count moved 107 → 120.
+
 ## Also checked, found clean
 
 - **No float on an amount.** `money.py` is integer-only by construction;

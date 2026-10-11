@@ -226,6 +226,23 @@ def _encode(payload):
         return None
 
 
+def _encode_text(text):
+    """`text` as the bytes of a text/plain response, or None if it cannot be one.
+
+    A stored field can hold a lone surrogate ("\\ud800"): JSON parses one
+    happily and `_require_string` has no reason to refuse it. `_encode` writes
+    it as an escape, but a plain `text.encode("utf-8")` raised
+    UnicodeEncodeError out of `_send_text`, and `GET /v1/receipts/{id}` with
+    `Accept: text/plain` closed the connection with no status line. Such a
+    character is shown as its backslash escape instead; anything that still
+    cannot be written comes back as None, exactly as `_encode` does.
+    """
+    try:
+        return text.encode("utf-8", errors="backslashreplace")
+    except (UnicodeError, AttributeError, TypeError):
+        return None
+
+
 def _clip(text, width):
     text = " ".join(text.split())
     return text if len(text) <= width else text[:width - 1] + "…"
@@ -311,20 +328,29 @@ class Handler(BaseHTTPRequestHandler):
             # The answer itself could not be written as JSON. That used to raise
             # out of the handler and close the connection with no status line,
             # so the caller could not tell a refusal from a crash. Say so instead.
-            status = 500
-            body = _encode({
-                "error": "unencodable_response",
-                "message": "the answer to this request could not be written as JSON; "
-                           "nothing about it is reported here",
-            })
+            return self._send_unencodable()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_unencodable(self):
+        body = _encode({
+            "error": "unencodable_response",
+            "message": "the answer to this request could not be written; "
+                       "nothing about it is reported here",
+        })
+        self.send_response(500)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_text(self, status, text):
-        body = text.encode("utf-8")
+        body = _encode_text(text)
+        if body is None:
+            return self._send_unencodable()
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

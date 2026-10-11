@@ -8,6 +8,8 @@ and passes its *answer* to the core.
 
 import http.client
 import json
+import socket
+import threading
 import urllib.request
 
 # The most this client reads of one node reply. A block_info answer is a few
@@ -25,8 +27,73 @@ class NodeError(Exception):
     """
 
 
+class _Deadline:
+    """Cuts every connection one RPC opened once its time is up.
+
+    A socket timeout bounds each read, not the reply: a node that trickles
+    eight bytes a second never lets one read time out, and could hold an
+    attach request, and the server thread answering it, for as long
+    as it liked. When `expire` runs, each connection's socket is shut down, so
+    whatever read is in progress returns at once and the RPC fails as a reply
+    that could not be read. A connection that finishes connecting after that
+    is shut down as soon as it exists.
+    """
+
+    def __init__(self):
+        self.expired = False
+        self._lock = threading.Lock()
+        self._sockets = []
+
+    def watch(self, sock):
+        with self._lock:
+            self._sockets.append(sock)
+            if self.expired:
+                _shut(sock)
+
+    def expire(self):
+        with self._lock:
+            self.expired = True
+            for sock in self._sockets:
+                _shut(sock)
+
+
+def _shut(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass  # already closed, which is what was wanted
+
+
+def _watched(connection_class, deadline):
+    class Watched(connection_class):
+        def connect(self):
+            super().connect()
+            deadline.watch(self.sock)
+    return Watched
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline):
+        super().__init__()
+        self.deadline = deadline
+
+    def do_open(self, http_class, req, **kwargs):
+        return super().do_open(_watched(http_class, self.deadline), req, **kwargs)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline):
+        super().__init__()
+        self.deadline = deadline
+
+    def do_open(self, http_class, req, **kwargs):
+        return super().do_open(_watched(http_class, self.deadline), req, **kwargs)
+
+
 class NanoNode:
     def __init__(self, url, timeout=10):
+        """`timeout` is in seconds and bounds the whole RPC: connecting, the
+        status line, the headers and the body together, not only each read."""
         self.url = url
         self.timeout = timeout
 
@@ -69,9 +136,29 @@ class NanoNode:
         # (IncompleteRead) all raised it straight past this guard, and each one
         # dropped the caller's connection. They are a reply that could not be
         # read, so they are the same 503 hold.
+        #
+        # And `timeout` bounded each socket read, not the reply, so a node
+        # sending a few bytes a second held the request for as long as it
+        # kept sending. `_Deadline` shuts the socket down once `timeout`
+        # seconds have passed in total; a reply not finished by then is the
+        # same 503 hold, even if what had arrived happened to parse.
+        deadline = _Deadline()
+        opener = urllib.request.build_opener(
+            _HTTPHandler(deadline), _HTTPSHandler(deadline))
+        timer = threading.Timer(self.timeout, deadline.expire)
+        timer.daemon = True
+        late = NodeError(
+            "%s did not finish answering %s within %s seconds; a reply still "
+            "arriving then is not read" % (self.url, action, self.timeout))
+        timer.start()
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read(MAX_REPLY_BYTES + 1)
+            try:
+                with opener.open(request, timeout=self.timeout) as response:
+                    body = response.read(MAX_REPLY_BYTES + 1)
+            finally:
+                timer.cancel()
+            if deadline.expired:
+                raise late
             if len(body) > MAX_REPLY_BYTES:
                 raise NodeError(
                     "%s answered %s with more than %d bytes; a block_info reply is "
@@ -79,6 +166,8 @@ class NanoNode:
                     % (self.url, action, MAX_REPLY_BYTES))
             return json.loads(body.decode("utf-8"))
         except (OSError, ValueError, RecursionError, http.client.HTTPException) as exc:
+            if deadline.expired:
+                raise late from None
             raise NodeError("%s did not answer %s: %s" % (self.url, action, exc)) from None
 
     def block_info(self, block_hash):
