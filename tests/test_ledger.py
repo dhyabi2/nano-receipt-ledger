@@ -749,16 +749,8 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
             FakeNode().rpc({"action": "process", "block": {}})
 
 
-class RepliesThatStillDroppedTheConnection(unittest.TestCase):
-    """Three node replies that got past the guards above, each over real sockets.
-
-    Each one used to raise something neither `rpc` nor `_dispatch` catches -
-    a ValueError from `int()` past Python's 4300-digit limit, a RecursionError
-    from `json.loads` - or, for the oversized body, was read whole with no
-    bound at all. Each test runs the real ledger HTTP server against a real
-    stub node and asserts the caller gets a status and a JSON body, and that
-    no receipt is recorded as paid.
-    """
+class NodeStubs:
+    """Helpers for running the real HTTP server against a real stub node."""
 
     def serve_node(self, body):
         import threading
@@ -786,7 +778,15 @@ class RepliesThatStillDroppedTheConnection(unittest.TestCase):
         return node_module.NanoNode("http://127.0.0.1:%d" % stub.server_address[1], timeout=10)
 
     def attach_over_http(self, node):
-        """Create a receipt and attach a block through the real HTTP server."""
+        """Create a receipt and attach a block through the real HTTP server,
+        and assert nothing was recorded as paid."""
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertIsNone(stored["block_hash"])
+        self.assertFalse(stored["confirmed"])
+        return status, answer
+
+    def attach_and_read_back(self, node):
+        """Create a receipt, attach a block over HTTP, return what was stored."""
         import threading
         application = Application(store=Store(), node=node, token=TOKEN, clock=Clock())
         server = make_server(application, "127.0.0.1", 0)
@@ -814,9 +814,7 @@ class RepliesThatStillDroppedTheConnection(unittest.TestCase):
         status, answer = fetch(
             "POST", "/v1/receipts/%s/attach-block" % receipt["id"], {"block_hash": block()})
         _, stored = application.handle("GET", "/v1/receipts/%s" % receipt["id"], {}, {}, None)
-        self.assertIsNone(stored["block_hash"])
-        self.assertFalse(stored["confirmed"])
-        return status, answer
+        return status, answer, stored
 
     @staticmethod
     def reply(**over):
@@ -824,6 +822,18 @@ class RepliesThatStillDroppedTheConnection(unittest.TestCase):
                   "contents": {"type": "state", "link_as_account": SELLER}}
         answer.update(over)
         return json.dumps(answer).encode("utf-8")
+
+
+class RepliesThatStillDroppedTheConnection(NodeStubs, unittest.TestCase):
+    """Three node replies that got past the guards above, each over real sockets.
+
+    Each one used to raise something neither `rpc` nor `_dispatch` catches -
+    a ValueError from `int()` past Python's 4300-digit limit, a RecursionError
+    from `json.loads` - or, for the oversized body, was read whole with no
+    bound at all. Each test runs the real ledger HTTP server against a real
+    stub node and asserts the caller gets a status and a JSON body, and that
+    no receipt is recorded as paid.
+    """
 
     def test_an_amount_past_the_integer_digit_limit_is_refused_not_dropped(self):
         """`"amount": "9" * 5000` made `int()` raise ValueError inside
@@ -844,6 +854,9 @@ class RepliesThatStillDroppedTheConnection(unittest.TestCase):
         # Padding still reads, however long, and the cap itself is an amount.
         self.assertEqual(raw_amount("0" * 5000 + "500"), 500)
         self.assertEqual(raw_amount(str(2 ** 128 - 1)), 2 ** 128 - 1)
+        # Zero is an amount: stripping every leading zero must not leave nothing.
+        self.assertEqual(raw_amount("0"), 0)
+        self.assertEqual(raw_amount("000"), 0)
 
     def test_a_deeply_nested_reply_is_a_503_not_a_dropped_connection(self):
         """`json.loads` raises RecursionError, not ValueError, on deep nesting."""
@@ -857,20 +870,36 @@ class RepliesThatStillDroppedTheConnection(unittest.TestCase):
         # The node answered; the message must not claim it was unreachable.
         self.assertIn("could not be read", answer["message"])
 
+    def padded_reply(self, size):
+        """A matching, confirmed reply padded with trailing whitespace to
+        exactly `size` bytes. Whitespace keeps every prefix of the padding
+        valid JSON, so the only thing that can refuse it is the size limit."""
+        body = self.reply()
+        self.assertLess(len(body), size)
+        return body + b" " * (size - len(body))
+
     def test_a_reply_over_the_size_limit_is_refused_unread(self):
-        """An otherwise matching, confirmed reply padded past the limit.
+        """An otherwise matching, confirmed reply one byte past the limit.
 
         Before, the whole body was read into memory with no bound and the
         block was accepted. A block_info answer is never that large, so it is
         a hold, not a verdict, and nothing is recorded.
         """
-        padding = "x" * (1024 * 1024 + 1)  # one byte past the 1 MiB limit
-        node = self.serve_node(self.reply(padding=padding))
+        node = self.serve_node(self.padded_reply(node_module.MAX_REPLY_BYTES + 1))
         with self.assertRaises(node_module.NodeError):
             node.block_info(block())
         status, answer = self.attach_over_http(node)
         self.assertEqual(status, 503, answer)
         self.assertEqual(answer["error"], "node_unavailable")
+
+    def test_a_reply_of_exactly_the_size_limit_is_still_read(self):
+        """The limit is inclusive: MAX_REPLY_BYTES itself is an answer."""
+        node = self.serve_node(self.padded_reply(node_module.MAX_REPLY_BYTES))
+        self.assertTrue(node.block_info(block())["found"])
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertEqual(status, 200, answer)
+        self.assertTrue(stored["confirmed"])
+        self.assertEqual(stored["block_hash"], block())
 
     def test_an_absurd_amount_xno_is_a_400_not_a_dropped_connection(self):
         """`str(raw)` in `create` raised ValueError past the digit limit."""
@@ -881,6 +910,316 @@ class RepliesThatStillDroppedTheConnection(unittest.TestCase):
                 "amount_xno": "9" * 4290, "reason": "why"})
         self.assertEqual(caught.exception.status, 400)
         self.assertEqual(caught.exception.code, "amount_out_of_range")
+
+
+class NodeValuesEchoedIntoARefusal(NodeStubs, unittest.TestCase):
+    """A node's `subtype` and `link_as_account` are echoed into a 409's detail.
+
+    They were echoed as sent. Nested a thousand lists deep, Python 3.12's
+    parser read them and `json.dumps(..., indent=2)` then raised
+    RecursionError while the refusal was being written, so the caller's
+    connection was dropped. On 3.10 and 3.11 the parse itself fails (a 503
+    hold); on 3.12 and 3.13 it is a 409 whose detail is short. Either is an
+    answer; a dropped connection is not.
+    """
+
+    def nested_reply(self, field, depth):
+        answer = {"amount": str(XNO // 100), "confirmed": "true", "subtype": "send",
+                  "contents": {"type": "state", "link_as_account": SELLER}}
+        marker = '"__NESTED__"'
+        if field == "subtype":
+            answer["subtype"] = "__NESTED__"
+        else:
+            answer["contents"]["link_as_account"] = "__NESTED__"
+        return json.dumps(answer).replace(marker, "[" * depth + "]" * depth).encode("utf-8")
+
+    def assert_answered(self, field, depth):
+        status, answer = self.attach_over_http(
+            self.serve_node(self.nested_reply(field, depth)))
+        self.assertIn(status, (409, 503), answer)
+        if status == 503:
+            self.assertEqual(answer["error"], "node_unavailable")
+        else:
+            self.assertEqual(answer["error"], "block_mismatch")
+            shown = answer["detail"][field]["got"]
+            self.assertIsInstance(shown, str)
+            self.assertLess(len(shown), 200)
+
+    def test_a_nested_destination_1000_deep_is_answered(self):
+        self.assert_answered("destination", 1000)
+
+    def test_a_nested_destination_5000_deep_is_answered(self):
+        self.assert_answered("destination", 5000)
+
+    def test_a_nested_subtype_1000_deep_is_answered(self):
+        self.assert_answered("subtype", 1000)
+
+    def test_a_nested_subtype_5000_deep_is_answered(self):
+        self.assert_answered("subtype", 5000)
+
+    def test_echoed_node_values_are_short_strings(self):
+        from core import _shown_value
+        self.assertIsNone(_shown_value(None))
+        self.assertEqual(_shown_value("receive"), "receive")
+        self.assertLess(len(_shown_value("x" * 100000)), 200)
+        self.assertEqual(_shown_value([[[]]]), "<a list, not a string>")
+        self.assertEqual(_shown_value({"a": 1}), "<a dict, not a string>")
+        self.assertEqual(_shown_value(10 ** 5000), "<a int, not a string>")
+        app = Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock())
+        receipt = app.ledger.create({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why"})
+        info = {"found": True, "confirmed": True, "subtype": "x" * 5000,
+                "destination": [[["deep"]]], "amount_raw": str(XNO)}
+        with self.assertRaises(LedgerError) as caught:
+            app.ledger.attach_block(receipt["id"], block(), info)
+        detail = caught.exception.detail
+        self.assertLess(len(detail["subtype"]["got"]), 200)
+        self.assertEqual(detail["destination"]["got"], "<a list, not a string>")
+
+
+class AnAnswerThatCannotBeWritten(unittest.TestCase):
+    """Whatever the answer is, the caller gets a status line and a JSON body.
+
+    `Handler._send` called `json.dumps` unguarded. Anything it could not encode
+    - nested past the recursion limit, circular, or of a type JSON has no
+    spelling for - raised out of the handler and closed the connection.
+    """
+
+    def serve(self, payload):
+        import threading
+
+        class Returns(Application):
+            def handle(self, method, path, query, headers, body):
+                return 200, payload
+
+        application = Returns(store=Store(), node=None, token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/v1/receipts" % server.server_address[1],
+                    timeout=30) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read().decode("utf-8"))
+
+    def assert_500(self, payload):
+        status, answer = self.serve(payload)
+        self.assertEqual(status, 500, answer)
+        self.assertEqual(answer["error"], "unencodable_response")
+
+    def test_a_payload_nested_past_the_recursion_limit_is_a_500(self):
+        deep = []
+        for _ in range(100000):
+            deep = [deep]
+        self.assert_500({"detail": deep})
+
+    def test_a_circular_payload_is_a_500(self):
+        loop = {}
+        loop["self"] = loop
+        self.assert_500(loop)
+
+    def test_a_payload_json_cannot_spell_is_a_500(self):
+        self.assert_500({"value": object()})
+
+    def test_a_request_body_nested_too_deeply_is_a_400(self):
+        import threading
+        application = Application(store=Store(), node=None, token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        body = b"[" * 200000 + b"]" * 200000
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/receipts" % server.server_address[1],
+            data=body, method="POST",
+            headers={"Content-Type": "application/json", "X-Ledger-Token": TOKEN})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                status, answer = response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            status, answer = error.code, json.loads(error.read())
+        self.assertEqual(status, 400, answer)
+        self.assertEqual(answer["error"], "bad_json")
+
+
+class ADeeplyNestedLinked(unittest.TestCase):
+    """A caller's `linked` is stored and echoed; it must be writable as JSON.
+
+    On 3.12 and 3.13 a `linked` nested 1500 deep parsed, was appended to the
+    ledger, and then made `Store.flush` raise RecursionError: the connection
+    was dropped and the receipt was in memory but not on disk.
+    """
+
+    def test_it_is_refused_before_anything_is_written(self):
+        import threading
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        store = Store(os.path.join(directory, "ledger.json"))
+        application = Application(store=store, node=None, token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        body = json.dumps({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why", "linked": {"x": "__NESTED__"},
+        }).replace('"__NESTED__"', "[" * 1500 + "]" * 1500).encode("utf-8")
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/receipts" % server.server_address[1],
+            data=body, method="POST",
+            headers={"Content-Type": "application/json", "X-Ledger-Token": TOKEN})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                status, answer = response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            status, answer = error.code, json.loads(error.read())
+        self.assertEqual(status, 400, answer)
+        # bad_json on 3.10/3.11, whose parser gives up first; bad_linked after.
+        self.assertIn(answer["error"], ("bad_json", "bad_linked"))
+        self.assertEqual(store.receipts(), [])
+
+    def test_a_shallow_linked_is_still_stored(self):
+        application = Application(store=Store(), node=None, token=TOKEN, clock=Clock())
+        receipt = application.ledger.create({
+            "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+            "amount_xno": "1", "reason": "why",
+            "linked": {"job_id": "job-1", "refs": [{"a": [1, 2]}]}})
+        self.assertEqual(receipt["linked"]["refs"], [{"a": [1, 2]}])
+        with self.assertRaises(LedgerError) as caught:
+            deep = []
+            for _ in range(40):
+                deep = [deep]
+            application.ledger.create({
+                "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+                "amount_xno": "1", "reason": "why", "linked": {"x": deep}})
+        self.assertEqual(caught.exception.code, "bad_linked")
+
+
+class AReplyThatIsNotHTTP(NodeStubs, unittest.TestCase):
+    """Replies http.client itself refuses, written byte for byte on a raw socket.
+
+    Each raises an http.client.HTTPException subclass - BadStatusLine,
+    LineTooLong, HTTPException("got more than 100 headers"), IncompleteRead -
+    and none of those is an OSError or a ValueError, so each went past `rpc`'s
+    guard and dropped the caller's connection. Each is a reply that could not
+    be read: a 503 hold, with nothing written.
+    """
+
+    def serve_raw(self, raw):
+        import socket
+        import threading
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        self.addCleanup(listener.close)
+
+        def loop():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                try:
+                    conn.settimeout(5)
+                    data = b""
+                    while b"\r\n\r\n" not in data:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                    head, _, rest = data.partition(b"\r\n\r\n")
+                    length = 0
+                    for line in head.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            length = int(line.split(b":", 1)[1])
+                    while len(rest) < length:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        rest += chunk
+                    conn.sendall(raw)
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+
+        threading.Thread(target=loop, daemon=True).start()
+        return node_module.NanoNode(
+            "http://127.0.0.1:%d" % listener.getsockname()[1], timeout=10)
+
+    def assert_held(self, raw):
+        node = self.serve_raw(raw)
+        with self.assertRaises(node_module.NodeError):
+            node.block_info(block())
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def test_a_garbage_status_line(self):
+        self.assert_held(b"HELLO WORLD\r\n\r\n" + self.reply())
+
+    def test_a_status_code_that_is_not_a_number(self):
+        self.assert_held(b"HTTP/1.1 abc OK\r\n\r\n")
+
+    def test_a_header_line_over_64_kib(self):
+        self.assert_held(b"HTTP/1.1 200 OK\r\nX: " + b"a" * 70000 + b"\r\n\r\n" + self.reply())
+
+    def test_more_than_100_headers(self):
+        self.assert_held(b"HTTP/1.1 200 OK\r\n" + b"X: a\r\n" * 200 + b"\r\n" + self.reply())
+
+    def test_a_chunk_size_that_is_not_hex(self):
+        self.assert_held(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
+                         + self.reply())
+
+    def test_a_chunked_body_cut_short(self):
+        self.assert_held(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabc")
+
+    def test_a_well_formed_chunked_reply_is_still_read(self):
+        body = self.reply()
+        node = self.serve_raw(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                              + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
+        self.assertTrue(node.block_info(block())["confirmed"])
+
+
+class AmountXnoAtTheDoor(Base):
+    """`parse_xno` edge cases: the 128-bit ceiling, script digits, padding."""
+
+    def test_the_largest_amount_at_six_places_is_accepted(self):
+        self.assertEqual(parse_xno("340282366.920938"), 340282366920938 * 10 ** 24)
+
+    def test_one_step_past_the_ceiling_is_refused(self):
+        from money import AmountError
+        with self.assertRaises(AmountError):
+            parse_xno("340282366.920939")
+
+    def test_digits_that_are_not_ascii_are_refused(self):
+        # Arabic-Indic one, fullwidth one, an Arabic-Indic fraction, a
+        # superscript two: str.isdigit() is True for every one of them.
+        for amount in ("١", "１", "1.٥", "٠.5", "²"):
+            with self.subTest(amount=amount):
+                with self.assertRaises(LedgerError) as caught:
+                    self.create(amount_xno=amount)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.code, "amount_out_of_range")
+
+    def test_zero_padding_past_the_digit_limit_is_read_not_dropped(self):
+        self.assertEqual(parse_xno("0" * 5000 + "1"), XNO)
+        self.assertEqual(parse_xno("0" * 5000 + "1.5"), XNO + XNO // 2)
+        self.assertEqual(parse_xno("0" * 5000 + ".5"), XNO // 2)
+        receipt = self.create(amount_xno="0" * 5000 + "0.05")
+        self.assertEqual(receipt["amount_xno"], "0.050000")
+
+    def test_padding_does_not_open_a_way_round_the_other_refusals(self):
+        for amount in ("0" * 5000, "0" * 5000 + ".0", "0" * 10 + "1" + "0" * 9,
+                       "-" + "0" * 5000 + "1", "0" * 5000 + "1.0000001"):
+            with self.subTest(amount=amount[:20]):
+                with self.assertRaises(LedgerError) as caught:
+                    self.create(amount_xno=amount)
+                self.assertEqual(caught.exception.code, "amount_out_of_range")
 
 
 class OverARealSocket(unittest.TestCase):

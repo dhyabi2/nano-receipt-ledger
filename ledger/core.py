@@ -111,6 +111,49 @@ def _shown_amount(value):
     return text
 
 
+# How deeply `linked` may nest. A job id or a URL needs one level.
+MAX_LINKED_DEPTH = 16
+
+
+def _depth(value):
+    """How many levels of lists and objects `value` nests, without recursing."""
+    deepest = 0
+    pending = [(value, 1)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, dict):
+            children = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        deepest = max(deepest, level)
+        if deepest > MAX_LINKED_DEPTH:
+            return deepest
+        pending.extend((child, level + 1) for child in children)
+    return deepest
+
+
+def _shown_value(value):
+    """A node-supplied `subtype` or `destination`, as a refusal's detail shows it.
+
+    The node's answer is echoed back into a 409, and the node's answer is
+    whatever the far end sent. A `subtype` or `link_as_account` nested a
+    thousand lists deep parsed on Python 3.12 and then made `json.dumps` raise
+    RecursionError while the refusal was being written, which dropped the
+    caller's connection. Only a short string or None is echoed as itself;
+    anything else is named by its type, and a long string is clipped exactly as
+    `_shown_amount` clips an amount.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "<a %s, not a string>" % type(value).__name__
+    if len(value) > MAX_SHOWN:
+        return "%s... (%d characters)" % (value[:MAX_SHOWN], len(value))
+    return value
+
+
 class Ledger:
     def __init__(self, store, clock):
         self.store = store
@@ -154,6 +197,15 @@ class Ledger:
         linked = body.get("linked", {}) or {}
         if not isinstance(linked, dict):
             raise LedgerError(400, "bad_linked", "'linked' must be an object")
+        if _depth(linked) > MAX_LINKED_DEPTH:
+            # Stored and echoed as given, so it has to be writable as JSON. On
+            # Python 3.12 and 3.13 a `linked` nested ~1000 deep parsed, was
+            # appended, and then made `json.dump` raise RecursionError in
+            # `Store.flush`: the caller's connection was dropped and the
+            # receipt existed in memory but not on disk.
+            raise LedgerError(
+                400, "bad_linked",
+                "'linked' is nested more than %d levels deep" % MAX_LINKED_DEPTH)
 
         receipt = {
             "id": new_receipt_id(),
@@ -218,7 +270,7 @@ class Ledger:
                 # A confirmed receive on our own chain pays nobody. This check
                 # exists because nano-settlement-verify shipped without it.
                 mismatches["subtype"] = {
-                    "expected": "send", "got": block_info.get("subtype")}
+                    "expected": "send", "got": _shown_value(block_info.get("subtype"))}
             paid = account_key(block_info.get("destination"))
             owed = account_key(receipt["counterparty_address"])
             if paid is None or owed is None or paid != owed:
@@ -226,7 +278,7 @@ class Ledger:
                 # destination is rejected exactly as it was before.
                 mismatches["destination"] = {
                     "expected": receipt["counterparty_address"],
-                    "got": block_info.get("destination"),
+                    "got": _shown_value(block_info.get("destination")),
                 }
             got_raw = raw_amount(block_info.get("amount_raw"))
             want_raw = raw_amount(receipt["amount_raw"])

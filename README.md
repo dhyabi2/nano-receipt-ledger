@@ -92,14 +92,20 @@ conversation.
   checksum and nothing downstream caught it; that is why this check is at the door.
 - An `amount_xno` with more than **six decimal places** → `400 amount_out_of_range`.
   The ledger publishes six, and it will not display a number that is not the number
-  paid.
+  paid. The same `400 amount_out_of_range` refuses an amount that is not a
+  positive decimal, one **above `2**128 - 1` raw** (340282366.920938 XNO is the
+  largest accepted), and one written with **digits that are not ASCII** (Arabic-Indic
+  or fullwidth digits, which `int()` would otherwise read). Leading zeros are
+  dropped before the amount is read, however many there are.
 - A `Content-Length` that is **not a non-negative number** → `400 bad_content_length`,
   and a declared length above one megabyte → `413 body_too_large`, answered without
   reading the body. Every write here is a small JSON object, and a caller that cannot
   be answered cannot tell "retry" from "refused".
 - A node that **did not answer**, or whose reply could not be read — a refused
-  connection, a timeout, a proxy's HTML page, a body that is not JSON, nested too
-  deeply to parse, or over 1 MiB, or a reply that names a block but whose
+  connection, a timeout, a reply that is not well-formed HTTP (a garbage status
+  line, an over-long or excessive header, a broken or truncated chunked body), a
+  proxy's HTML page, a body that is not JSON, nested too deeply to parse, or over
+  1 MiB, or a reply that names a block but whose
   `contents` is not an object (for instance an opaque string, because the endpoint
   ignored `json_block`) → `503 node_unavailable`, and **nothing is written**, so
   the receipt is still pending and the retry is safe. This is a hold, never a
@@ -107,6 +113,13 @@ conversation.
   carrying an `error` field — including a rate limit or other transient refusal —
   is **not** in this list: it is still answered `404 block_not_found`. Nothing is
   written then either, but the code does not say "retry".
+- A node value echoed into a `409 block_mismatch` detail (`subtype`,
+  `destination`, `amount`) is shown as a short string: a long one is clipped and
+  anything that is not a string is named by its type. If an answer still cannot be
+  written as JSON, the caller gets `500 unencodable_response` rather than a closed
+  connection. A request body nested too deeply to parse is `400 bad_json`, and a
+  `linked` object nested more than 16 levels deep is `400 bad_linked`, before
+  anything is written.
 
 `paid_xno_total` counts confirmed receipts only. Pending amounts are reported
 separately and are never folded in. All arithmetic is on integer raw — 1 XNO is
@@ -136,7 +149,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 83 unit tests
+python3 -m unittest discover -s tests -v   # 107 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

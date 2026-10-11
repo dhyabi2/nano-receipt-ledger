@@ -62,7 +62,24 @@ def parse_xno(amount) -> int:
     if not isinstance(amount, str):
         raise AmountError("amount_xno must be a string, got %s" % type(amount).__name__)
     text = amount.strip()
+    # ASCII digits only. `xno_to_raw` checks with `str.isdigit`, which is True
+    # for Arabic-Indic and fullwidth digits too, and `int()` reads them, so
+    # "\u0661" was accepted as 1 XNO. An amount is written in ASCII; anything
+    # else is refused here, before the vendored function is reached.
+    if not text.isascii():
+        raise AmountError("amount_xno must be written with ASCII digits: %r"
+                          % _clipped(amount))
     whole, _, frac = text.partition(".")
+    # Leading zeros carry no value, but `int()` counts them against Python's
+    # 4300-digit limit, so "0" * 5000 + "1" raised ValueError out of `create`
+    # rather than being read as 1. Drop them; MAX_RAW still bounds what is left.
+    stripped = whole.lstrip("0")
+    if stripped != whole:
+        whole = stripped or "0"
+        text = whole + ("." + frac if "." in text else "")
+    if len(whole) > len(str(MAX_RAW // RAW_PER_XNO)):
+        raise AmountError(
+            "amount_xno is more than the 2**128 - 1 raw any Nano account can hold")
     if len(frac) > DISPLAY_PLACES:
         raise AmountError(
             "amount_xno carries %d decimal places; this ledger publishes %d, and it "
@@ -83,6 +100,10 @@ def parse_xno(amount) -> int:
         raise AmountError(
             "amount_xno is more than the 2**128 - 1 raw any Nano account can hold")
     return raw
+
+
+def _clipped(text, width=40):
+    return text if len(text) <= width else text[:width] + "..."
 
 
 def format_xno(raw: int) -> str:

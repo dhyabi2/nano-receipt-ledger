@@ -6,6 +6,7 @@ does not import this module at all; the HTTP layer is handed a node object
 and passes its *answer* to the core.
 """
 
+import http.client
 import json
 import urllib.request
 
@@ -60,6 +61,14 @@ class NanoNode:
         # answer is a few kilobytes; anything over MAX_REPLY_BYTES is refused
         # unread past the limit. RecursionError is named, not `Exception`,
         # for the reason given above.
+        #
+        # http.client.HTTPException is the last family. It is not an OSError:
+        # a status line that is not HTTP (BadStatusLine), a status code that is
+        # not a number, a header line over 64 KiB (LineTooLong), more than 100
+        # headers, a chunk size that is not hex and a chunked body cut short
+        # (IncompleteRead) all raised it straight past this guard, and each one
+        # dropped the caller's connection. They are a reply that could not be
+        # read, so they are the same 503 hold.
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = response.read(MAX_REPLY_BYTES + 1)
@@ -69,7 +78,7 @@ class NanoNode:
                     "never that large, so it was not read"
                     % (self.url, action, MAX_REPLY_BYTES))
             return json.loads(body.decode("utf-8"))
-        except (OSError, ValueError, RecursionError) as exc:
+        except (OSError, ValueError, RecursionError, http.client.HTTPException) as exc:
             raise NodeError("%s did not answer %s: %s" % (self.url, action, exc)) from None
 
     def block_info(self, block_hash):

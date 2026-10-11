@@ -130,6 +130,61 @@ The 503 message said the node "could not be reached" even when it had answered
 something unreadable; it now says either case. Status and error code are
 unchanged.
 
+## Found in a second review and fixed on this branch
+
+A second adversarial review, run on `4f3d570`, showed the branch's claim — a
+node reply that cannot be read is a 503 hold, never a dropped connection — still
+did not hold. Each item below has a test over a real socket that fails on
+`4f3d570`, unless it says otherwise.
+
+- **Node values echoed unclipped into a 409, and an unguarded response writer.**
+  `attach_block` put the node's `subtype` and `link_as_account` into the
+  `block_mismatch` detail exactly as sent. Nested 1000 or 5000 lists deep,
+  Python 3.12's parser read them, and `json.dumps(..., indent=2)` in
+  `Handler._send` then raised RecursionError: the caller's connection was
+  dropped. (On 3.10 and 3.11 the parse fails first, which was already the 503
+  hold; on 3.13 the encoder copes.) Both are now shown through `_shown_value`:
+  None or a string of at most 64 characters as itself, a longer string clipped,
+  anything else named by its type. `_send` no longer trusts its payload either:
+  an answer that cannot be encoded (RecursionError, a circular reference's
+  ValueError, a TypeError) is `500 unencodable_response` with a JSON body.
+  (`NodeValuesEchoedIntoARefusal` and `AnAnswerThatCannotBeWritten`. On
+  `4f3d570` the four nested-reply tests drop the connection on 3.12, fail on
+  3.13 because the detail echoes the nested list unclipped, and pass on 3.10
+  and 3.11, where the reply was already a 503.)
+- **Replies that are not well-formed HTTP.** `rpc` caught OSError, ValueError
+  and RecursionError, but `http.client.HTTPException` is none of them. A garbage
+  status line, a status code that is not a number, a header line over 64 KiB,
+  more than 100 headers, a chunk size that is not hex and a chunked body cut
+  short each dropped the connection. HTTPException is now caught as `NodeError`
+  → `503 node_unavailable` (`AReplyThatIsNotHTTP`, written byte for byte on a
+  raw socket).
+- **`amount_xno` in digits that are not ASCII, and zero padding.**
+  `xno_to_raw` checks with `str.isdigit`, which is True for Arabic-Indic and
+  fullwidth digits, and `int()` reads them, so `"\u0661"` was accepted as 1 XNO.
+  `parse_xno` now refuses any non-ASCII amount as `400 amount_out_of_range`
+  before the vendored function is called (the vendored functions are unchanged).
+  It also drops leading zeros first: `"0" * 5000 + "1"` raised ValueError past
+  Python's integer-digit limit inside `create` and dropped the connection; it now
+  reads as 1 XNO, and a whole part longer than any amount under `2**128 - 1` raw
+  is refused without being handed to `int()` (`AmountXnoAtTheDoor`).
+- **A request body or `linked` nested too deeply.** Not a node reply, but the
+  same drop: a request body nested 200000 deep raised RecursionError out of
+  `_dispatch` (now `400 bad_json`), and on 3.12 and 3.13 a `linked` nested 1500
+  deep parsed, was appended, and then made `Store.flush` raise — the connection
+  was dropped and the receipt was in memory but not on disk. `linked` deeper
+  than 16 levels is now `400 bad_linked` before anything is written
+  (`ADeeplyNestedLinked`).
+- **Tests tightened** (these pass on `4f3d570` too; they pin behaviour rather
+  than catch a bug): the size-limit test pads with whitespace, so cutting the
+  read cannot itself make the body invalid JSON, and asserts both sides — a
+  reply of `MAX_REPLY_BYTES + 1` is a 503 and one of exactly `MAX_REPLY_BYTES`
+  is read and settles. `raw_amount("0")` and `raw_amount("000")` are 0;
+  `parse_xno` accepts `340282366.920938` and refuses `340282366.920939`.
+
+The README's refusal list now names these cases and its unit-test count moved
+83 → 107.
+
 ### Known limitation, left as is
 
 A reply that is readable JSON carrying an `error` field — `Block not found`, but
