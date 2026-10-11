@@ -13,7 +13,7 @@ import secrets
 
 import nanoaddr
 from errors import LedgerError
-from money import AmountError, format_xno, parse_xno
+from money import MAX_RAW, AmountError, format_xno, parse_xno
 
 KINDS = ("grant", "work_settlement", "tip", "refund")
 BLOCK_HASH_RE = re.compile(r"\A[0-9A-F]{64}\Z")
@@ -55,6 +55,12 @@ def account_key(address):
     return verdict["public_key"] if verdict["valid"] else None
 
 
+# MAX_RAW (2**128 - 1) has 39 digits; no raw amount has more significant ones.
+MAX_RAW_DIGITS = len(str(MAX_RAW))
+# The longest amount text a refusal's detail echoes back in full.
+MAX_SHOWN = 64
+
+
 def raw_amount(value):
     """`value` as an integer of raw, or None if it does not spell one.
 
@@ -66,11 +72,43 @@ def raw_amount(value):
     have to be ASCII for that promise to hold - `"\u00b2".isdigit()` is True and
     `int("\u00b2")` raises, so `isdigit` alone would let a ValueError escape a
     money comparison.
+
+    The length is bounded for the same promise. `int()` refuses a string of
+    more than 4300 digits with ValueError (Python's integer-digit limit), and
+    a node reply carrying `"amount": "9" * 5000` raised it out of
+    `attach_block` and dropped the caller's connection. A Nano raw amount is
+    at most 2**128 - 1, which is 39 significant digits; leading zeros are
+    still read as before, and anything with more significant digits is not an
+    amount any block can carry, so it comes back as None and is refused.
     """
-    text = str(value).strip()
+    try:
+        text = str(value).strip()
+    except ValueError:
+        # str() of an int past the digit limit raises too.
+        return None
     if not text or not text.isascii() or not text.isdigit():
         return None
-    return int(text)
+    # int() counts leading zeros toward its digit limit, so they go first.
+    significant = text.lstrip("0") or "0"
+    if len(significant) > MAX_RAW_DIGITS:
+        return None
+    amount = int(significant)
+    return amount if amount <= MAX_RAW else None
+
+
+def _shown_amount(value):
+    """`value` as text for a refusal's detail, never raising and never huge.
+
+    `str()` of an integer past Python's digit limit raises ValueError, and a
+    refusal that raises is a dropped connection, not a refusal.
+    """
+    try:
+        text = str(value)
+    except ValueError:
+        return "<an integer too long to show>"
+    if len(text) > MAX_SHOWN:
+        return "%s... (%d characters)" % (text[:MAX_SHOWN], len(text))
+    return text
 
 
 class Ledger:
@@ -194,7 +232,7 @@ class Ledger:
             want_raw = raw_amount(receipt["amount_raw"])
             if got_raw is None or want_raw is None or got_raw != want_raw:
                 mismatches["amount"] = {
-                    "expected": receipt["amount_raw"], "got": str(block_info.get("amount_raw"))}
+                    "expected": receipt["amount_raw"], "got": _shown_amount(block_info.get("amount_raw"))}
             if mismatches:
                 raise LedgerError(
                     409, "block_mismatch",

@@ -9,6 +9,9 @@ and passes its *answer* to the core.
 import json
 import urllib.request
 
+# The most this client reads of one node reply. A block_info answer is a few
+# kilobytes; one mebibyte is generous and still bounded.
+MAX_REPLY_BYTES = 1024 * 1024
 
 class NodeError(Exception):
     """This client could not get an answer out of the node.
@@ -48,10 +51,25 @@ class NanoNode:
         # ValueError). Deliberately not `except Exception`: a wrong *action*
         # still raises NodeError above, loudly, and nothing else here should
         # be turned into "the node is down".
+        #
+        # Two more ways a reply escaped that guard. A deeply nested body
+        # (`[[[[...]]]]`) makes `json.loads` raise RecursionError, which is
+        # neither OSError nor ValueError, and the caller's connection was
+        # dropped again. And `response.read()` had no bound, so an endpoint
+        # could stream an arbitrarily large body into memory. A block_info
+        # answer is a few kilobytes; anything over MAX_REPLY_BYTES is refused
+        # unread past the limit. RecursionError is named, not `Exception`,
+        # for the reason given above.
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (OSError, ValueError) as exc:
+                body = response.read(MAX_REPLY_BYTES + 1)
+            if len(body) > MAX_REPLY_BYTES:
+                raise NodeError(
+                    "%s answered %s with more than %d bytes; a block_info reply is "
+                    "never that large, so it was not read"
+                    % (self.url, action, MAX_REPLY_BYTES))
+            return json.loads(body.decode("utf-8"))
+        except (OSError, ValueError, RecursionError) as exc:
             raise NodeError("%s did not answer %s: %s" % (self.url, action, exc)) from None
 
     def block_info(self, block_hash):

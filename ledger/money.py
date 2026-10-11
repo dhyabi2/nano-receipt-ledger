@@ -10,6 +10,9 @@ dependency of any kind, including on that one.
 
 RAW_PER_XNO = 10 ** 30
 
+# The largest balance a Nano account can hold, in raw: a balance is 128 bits.
+MAX_RAW = 2 ** 128 - 1
+
 
 def xno_to_raw(amount: str) -> int:
     """Exact decimal XNO -> integer raw. No float is used anywhere."""
@@ -72,6 +75,13 @@ def parse_xno(amount) -> int:
         raise AmountError(str(exc)) from None
     if raw <= 0:
         raise AmountError("amount_xno must be greater than zero")
+    # No Nano account can hold more than 2**128 - 1 raw, so no block can pay
+    # more. Without this bound an amount_xno of a few thousand digits parsed,
+    # and then `str(raw)` in `Ledger.create` raised ValueError past Python's
+    # integer-digit limit and dropped the caller's connection.
+    if raw > MAX_RAW:
+        raise AmountError(
+            "amount_xno is more than the 2**128 - 1 raw any Nano account can hold")
     return raw
 
 

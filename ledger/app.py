@@ -140,7 +140,8 @@ class Application:
         except NodeError as exc:
             raise LedgerError(
                 503, "node_unavailable",
-                "the Nano node could not be reached, so this block was not checked and "
+                "no usable answer came from the Nano node (it could not be reached, or "
+                "its reply could not be read), so this block was not checked and "
                 "nothing was attached; the receipt is unchanged and the request can be "
                 "retried: %s" % exc) from None
         return 200, self.render(self.ledger.attach_block(params["receipt_id"], block_hash, info))

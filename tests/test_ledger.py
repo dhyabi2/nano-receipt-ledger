@@ -718,8 +718,10 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
         """Control: the two shapes that worked are untouched, field for field.
 
         A node error answer is still a not-found, and a well-formed answer still
-        yields the same five facts - so this adds a hold and takes no verdict
-        away.
+        yields the same five facts. The one verdict that did change is for a
+        reply with `contents` missing, null or not an object: it was a terminal
+        409 (block_unconfirmed or block_mismatch) and is now the retryable 503
+        hold above.
         """
         self.assertEqual(
             node_module.normalise({"error": "Block not found"}),
@@ -745,6 +747,140 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
         self.assertIn("only block_info", str(caught.exception))
         with self.assertRaises(RefusesToSend):
             FakeNode().rpc({"action": "process", "block": {}})
+
+
+class RepliesThatStillDroppedTheConnection(unittest.TestCase):
+    """Three node replies that got past the guards above, each over real sockets.
+
+    Each one used to raise something neither `rpc` nor `_dispatch` catches -
+    a ValueError from `int()` past Python's 4300-digit limit, a RecursionError
+    from `json.loads` - or, for the oversized body, was read whole with no
+    bound at all. Each test runs the real ledger HTTP server against a real
+    stub node and asserts the caller gets a status and a JSON body, and that
+    no receipt is recorded as paid.
+    """
+
+    def serve_node(self, body):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Stub(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass  # the client stopped reading at its limit
+
+            def log_message(self, *args):
+                pass
+
+        stub = HTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        self.addCleanup(stub.server_close)
+        self.addCleanup(stub.shutdown)
+        return node_module.NanoNode("http://127.0.0.1:%d" % stub.server_address[1], timeout=10)
+
+    def attach_over_http(self, node):
+        """Create a receipt and attach a block through the real HTTP server."""
+        import threading
+        application = Application(store=Store(), node=node, token=TOKEN, clock=Clock())
+        server = make_server(application, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+
+        def fetch(method, path, body=None):
+            request = urllib.request.Request(
+                base + path, data=json.dumps(body).encode("utf-8"), method=method,
+                headers={"Content-Type": "application/json", "X-Ledger-Token": TOKEN})
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read().decode("utf-8"))
+
+        status, receipt = fetch("POST", "/v1/receipts", {
+            "kind": "work_settlement", "counterparty": "arion",
+            "counterparty_address": SELLER, "amount_xno": "0.010000",
+            "reason": "delivered the extraction job"})
+        self.assertEqual(status, 201, receipt)
+        # Before the fixes this raised http.client.RemoteDisconnected.
+        status, answer = fetch(
+            "POST", "/v1/receipts/%s/attach-block" % receipt["id"], {"block_hash": block()})
+        _, stored = application.handle("GET", "/v1/receipts/%s" % receipt["id"], {}, {}, None)
+        self.assertIsNone(stored["block_hash"])
+        self.assertFalse(stored["confirmed"])
+        return status, answer
+
+    @staticmethod
+    def reply(**over):
+        answer = {"amount": str(XNO // 100), "confirmed": "true", "subtype": "send",
+                  "contents": {"type": "state", "link_as_account": SELLER}}
+        answer.update(over)
+        return json.dumps(answer).encode("utf-8")
+
+    def test_an_amount_past_the_integer_digit_limit_is_refused_not_dropped(self):
+        """`"amount": "9" * 5000` made `int()` raise ValueError inside
+        `attach_block`. It is not an amount any block can carry, so it is
+        refused as a mismatch, exactly as any other unreadable amount is."""
+        status, answer = self.attach_over_http(
+            self.serve_node(self.reply(amount="9" * 5000)))
+        self.assertEqual(status, 409, answer)
+        self.assertEqual(answer["error"], "block_mismatch")
+        self.assertIn("amount", answer["detail"])
+        self.assertLess(len(answer["detail"]["amount"]["got"]), 200)
+
+    def test_raw_amount_never_raises_on_a_long_or_oversized_amount(self):
+        from core import raw_amount
+        for value in ("9" * 5000, "1" + "0" * 39, str(2 ** 128), 10 ** 40):
+            with self.subTest(value=str(value)[:20]):
+                self.assertIsNone(raw_amount(value))
+        # Padding still reads, however long, and the cap itself is an amount.
+        self.assertEqual(raw_amount("0" * 5000 + "500"), 500)
+        self.assertEqual(raw_amount(str(2 ** 128 - 1)), 2 ** 128 - 1)
+
+    def test_a_deeply_nested_reply_is_a_503_not_a_dropped_connection(self):
+        """`json.loads` raises RecursionError, not ValueError, on deep nesting."""
+        depth = 200000
+        node = self.serve_node(b"[" * depth + b"]" * depth)
+        with self.assertRaises(node_module.NodeError):
+            node.block_info(block())
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+        # The node answered; the message must not claim it was unreachable.
+        self.assertIn("could not be read", answer["message"])
+
+    def test_a_reply_over_the_size_limit_is_refused_unread(self):
+        """An otherwise matching, confirmed reply padded past the limit.
+
+        Before, the whole body was read into memory with no bound and the
+        block was accepted. A block_info answer is never that large, so it is
+        a hold, not a verdict, and nothing is recorded.
+        """
+        padding = "x" * (1024 * 1024 + 1)  # one byte past the 1 MiB limit
+        node = self.serve_node(self.reply(padding=padding))
+        with self.assertRaises(node_module.NodeError):
+            node.block_info(block())
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
+    def test_an_absurd_amount_xno_is_a_400_not_a_dropped_connection(self):
+        """`str(raw)` in `create` raised ValueError past the digit limit."""
+        application = Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock())
+        with self.assertRaises(LedgerError) as caught:
+            application.handle("POST", "/v1/receipts", {}, {"X-Ledger-Token": TOKEN}, {
+                "kind": "tip", "counterparty": "a", "counterparty_address": SELLER,
+                "amount_xno": "9" * 4290, "reason": "why"})
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.code, "amount_out_of_range")
 
 
 class OverARealSocket(unittest.TestCase):
