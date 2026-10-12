@@ -1410,7 +1410,107 @@ class ABodyShorterThanItsContentLength(unittest.TestCase):
             sock.close()
         self.assertTrue(answer.startswith(b"HTTP/1."), "no HTTP response at all: %r" % answer[:120])
         self.assertIn(b" 408 ", answer.split(b"\r\n")[0])
-        self.assertEqual(json.loads(answer.split(b"\r\n\r\n", 1)[1])["error"], "request_timeout")
+        error = json.loads(answer.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(error["error"], "request_timeout")
+        self.assertIn("did not arrive in time (2 of 100 bytes after", error["message"])
+
+
+class ARequestDripFedPastItsDeadline(unittest.TestCase):
+    """The idle timeout is reset by every byte; the deadline bounds the whole request.
+
+    A caller sending one byte just inside the idle timeout, forever, used to hold
+    a worker thread forever. With the idle timeout at 1 s and the deadline at
+    2 s, bytes arriving every 0.3 s never trip the first and must trip the second.
+    """
+
+    IDLE, DEADLINE, DRIP = 1.0, 2.0, 0.3
+    HEAD = (b"POST /v1/receipts/rcpt_0000000000000000/attach-block HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"X-Ledger-Token: " + TOKEN.encode() + b"\r\n"
+            b"Content-Type: application/json\r\n")
+
+    def setUp(self):
+        import threading
+        from unittest import mock
+        for name, value in (("REQUEST_TIMEOUT_SECONDS", self.IDLE),
+                            ("REQUEST_DEADLINE_SECONDS", self.DEADLINE)):
+            patch = mock.patch.object(app_module, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.server = make_server(Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock()),
+                                  "127.0.0.1", 0)
+        self.host, self.port = self.server.server_address[:2]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def exchange(self, opening, drip=b"", gap=None):
+        """Send `opening`, then `drip` one piece every `gap` seconds; return (answer, seconds)."""
+        import socket
+        import threading
+        import time
+        sock = socket.create_connection((self.host, self.port), timeout=10)
+        stop = threading.Event()
+
+        def dripper():
+            for piece in drip:
+                if stop.wait(gap):
+                    return
+                try:
+                    sock.sendall(piece)
+                except OSError:
+                    return
+
+        started = time.monotonic()
+        sock.sendall(opening)
+        thread = threading.Thread(target=dripper, daemon=True)
+        thread.start()
+        chunks = []
+        try:
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                chunks.append(piece)
+        except socket.timeout:
+            self.fail("the connection was still open after 10 s")
+        except ConnectionResetError:
+            pass
+        finally:
+            elapsed = time.monotonic() - started
+            stop.set()
+            thread.join()
+            sock.close()
+        return b"".join(chunks), elapsed
+
+    def test_a_drip_fed_body_is_answered_408_at_the_deadline(self):
+        answer, elapsed = self.exchange(self.HEAD + b"Content-Length: 1000\r\n\r\n",
+                                        [b" "] * 1000, self.DRIP)
+        self.assertIn(b" 408 ", answer.split(b"\r\n")[0], answer[:200])
+        error = json.loads(answer.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(error["error"], "request_timeout")
+        self.assertRegex(error["message"], r"\(\d+ of 1000 bytes after 2\.\d s\)")
+        self.assertGreaterEqual(elapsed, self.DEADLINE - 0.1)
+        self.assertLess(elapsed, self.DEADLINE + 1.0)
+
+    def test_drip_fed_headers_are_closed_at_the_deadline(self):
+        answer, elapsed = self.exchange(self.HEAD, [b"X"] * 1000, self.DRIP)
+        self.assertEqual(answer, b"")
+        self.assertGreaterEqual(elapsed, self.DEADLINE - 0.1)
+        self.assertLess(elapsed, self.DEADLINE + 1.0)
+
+    def test_an_honest_body_in_a_few_quick_chunks_is_read_whole(self):
+        body = json.dumps({"block_hash": "A" * 64}).encode()
+        pieces = [body[:20], body[20:50], body[50:]]
+        answer, elapsed = self.exchange(
+            self.HEAD + b"Content-Length: %d\r\n\r\n" % len(body), pieces, 0.4)
+        # 404 not_found is the answer for this body to an unknown receipt: it was
+        # read whole and parsed, which a 400 bad_json or a 408 would deny.
+        self.assertIn(b" 404 ", answer.split(b"\r\n")[0], answer[:200])
+        self.assertEqual(json.loads(answer.split(b"\r\n\r\n", 1)[1])["error"], "not_found")
+        self.assertLess(elapsed, self.DEADLINE)
 
 
 GUARD_STEP = "No token, seed or key may be committed"

@@ -129,6 +129,19 @@ conversation.
   `file`, `data` or any other scheme is refused at once as the same hold. A node
   that answers with an HTTP error status (a 500, a 404) is the same hold.
   Proxies and certificate verification behave as with the standard `urlopen`.
+- A **caller** that is slow is bounded by two limits of its own. Each read from the
+  caller's connection may wait at most **30 seconds** for the next bytes (the idle
+  timeout), and the request line, headers and body together must arrive within
+  **60 seconds** of the connection being accepted (the deadline), however steadily
+  they trickle in. A body that is still incomplete when either limit passes - for
+  instance one shorter than its `Content-Length` - is answered `408 request_timeout`,
+  whose message says how many of the declared bytes arrived and after how long, and
+  the connection is closed. A request line or headers still incomplete at that point
+  get no response: the connection is closed, as the standard library does. Writing
+  the response is bounded by the idle timeout alone, so a caller that reads the
+  response too slowly is cut off. The server speaks HTTP/1.0: every connection
+  carries one request and is closed after its response. Both values can be changed
+  with `serve.py --request-timeout SECONDS --request-deadline SECONDS`.
 - A node value echoed into a `409 block_mismatch` detail (`subtype`,
   `destination`, `amount`) is shown exactly when it is a string of up to 128
   characters, so any Nano address (65 characters as `nano_`, 64 as `xrb_`) is shown
@@ -172,7 +185,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 140 unit tests
+python3 -m unittest discover -s tests -v   # 143 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

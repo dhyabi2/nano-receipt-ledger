@@ -16,7 +16,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ledger"))
 
-from app import Application, make_server  # noqa: E402
+from app import (Application, REQUEST_DEADLINE_SECONDS,  # noqa: E402
+                 REQUEST_TIMEOUT_SECONDS, make_server)
 from node import NanoNode  # noqa: E402
 from store import Store  # noqa: E402
 
@@ -28,6 +29,12 @@ def main(argv=None):
     parser.add_argument("--store", default="data/ledger.json")
     parser.add_argument("--node", default=None, help="Nano node RPC URL, read-only")
     parser.add_argument("--base-url", default="")
+    parser.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT_SECONDS,
+                        help="seconds one read or write may wait for progress "
+                             "(default %(default)s)")
+    parser.add_argument("--request-deadline", type=float, default=REQUEST_DEADLINE_SECONDS,
+                        help="seconds the request line, headers and body may take "
+                             "to arrive in all (default %(default)s)")
     args = parser.parse_args(argv)
 
     token = os.environ.get("RECEIPT_LEDGER_TOKEN", "")
@@ -42,7 +49,9 @@ def main(argv=None):
         base_url=args.base_url,
         node_rpc_url=args.node or "https://<any-public-nano-node>",
     )
-    server = make_server(application, args.host, args.port)
+    server = make_server(application, args.host, args.port,
+                         request_timeout=args.request_timeout,
+                         request_deadline=args.request_deadline)
     host, port = server.server_address[:2]
     print("receipt ledger on http://%s:%d  (reads are public, writes need the token)"
           % (host, port))
