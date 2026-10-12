@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.join(ROOT, "ledger"))
 
 import app as app_module  # noqa: E402
 import node as node_module  # noqa: E402
-from app import Application, ROUTES, make_server, tokens_match  # noqa: E402
+from app import (Application, MAX_TIMEOUT_SECONDS, ROUTES,  # noqa: E402
+                 make_server, tokens_match)
 from core import Ledger  # noqa: E402
 from errors import LedgerError  # noqa: E402
 from money import AmountError, format_xno, parse_xno  # noqa: E402
@@ -1361,6 +1362,315 @@ class AMalformedContentLength(unittest.TestCase):
         # The control: the same path with a correct header reaches the ledger
         # and gets its ordinary 404 for an id that does not exist.
         self.assert_json_error(self.raw_request(b"2"), 404, "not_found")
+
+
+class ABodyShorterThanItsContentLength(unittest.TestCase):
+    """A caller that declares more bytes than it sends must get a 408, not a hung worker.
+
+    `rfile.read(length)` had no socket timeout, so `Content-Length: 100` with a
+    two-byte body held a worker thread for as long as the caller kept the
+    socket open. Over a real socket: the client sends the short body and waits.
+    """
+
+    def setUp(self):
+        import threading
+        from unittest import mock
+        patch = mock.patch.object(app_module, "REQUEST_TIMEOUT_SECONDS", 0.5, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.server = make_server(Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock()),
+                                  "127.0.0.1", 0)
+        self.host, self.port = self.server.server_address[:2]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_a_short_body_is_answered_408_and_the_connection_closed(self):
+        import socket
+        sock = socket.create_connection((self.host, self.port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /v1/receipts/rcpt_0000000000000000/attach-block HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"X-Ledger-Token: " + TOKEN.encode() + b"\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 100\r\n\r\n{}")
+            chunks = []
+            try:
+                while True:
+                    piece = sock.recv(4096)
+                    if not piece:
+                        break
+                    chunks.append(piece)
+            except socket.timeout:
+                self.fail("the request never returned: a worker is still waiting for 98 bytes")
+            answer = b"".join(chunks)
+        finally:
+            sock.close()
+        self.assertTrue(answer.startswith(b"HTTP/1."), "no HTTP response at all: %r" % answer[:120])
+        self.assertIn(b" 408 ", answer.split(b"\r\n")[0])
+        error = json.loads(answer.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(error["error"], "request_timeout")
+        self.assertIn("did not arrive in time (2 of 100 bytes after", error["message"])
+
+    def test_a_body_cut_short_by_the_caller_closing_is_answered_400_and_not_recorded(self):
+        """EOF before Content-Length bytes is not a body: nothing is parsed or written.
+
+        A caller that shuts down its write side after a valid JSON prefix used to
+        get that prefix processed as the whole body - a 201 and a receipt in the
+        append-only ledger, from a request that never finished arriving.
+        """
+        import socket
+        body = json.dumps({
+            "kind": "work_settlement", "counterparty": "arion",
+            "counterparty_address": SELLER, "amount_xno": "0.050000",
+            "reason": "delivered the extraction job"}).encode()
+        sock = socket.create_connection((self.host, self.port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /v1/receipts HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"X-Ledger-Token: " + TOKEN.encode() + b"\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % (len(body) + 50) + body)
+            sock.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                chunks.append(piece)
+            answer = b"".join(chunks)
+        finally:
+            sock.close()
+        self.assertTrue(answer.startswith(b"HTTP/1."), "no HTTP response at all: %r" % answer[:120])
+        self.assertIn(b" 400 ", answer.split(b"\r\n")[0])
+        error = json.loads(answer.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(error["error"], "incomplete_body")
+        self.assertIn("%d of %d bytes, then the connection closed" % (len(body), len(body) + 50),
+                      error["message"])
+        self.assertEqual(self.server.RequestHandlerClass.application.store.receipts(), [])
+
+
+class ARequestDripFedPastItsDeadline(unittest.TestCase):
+    """The idle timeout is reset by every byte; the deadline bounds the whole request.
+
+    A caller sending one byte just inside the idle timeout, forever, used to hold
+    a worker thread forever. With the idle timeout at 1 s and the deadline at
+    2 s, bytes arriving every 0.3 s never trip the first and must trip the second.
+    """
+
+    IDLE, DEADLINE, DRIP = 1.0, 2.0, 0.3
+    HEAD = (b"POST /v1/receipts/rcpt_0000000000000000/attach-block HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"X-Ledger-Token: " + TOKEN.encode() + b"\r\n"
+            b"Content-Type: application/json\r\n")
+
+    def setUp(self):
+        import threading
+        from unittest import mock
+        for name, value in (("REQUEST_TIMEOUT_SECONDS", self.IDLE),
+                            ("REQUEST_DEADLINE_SECONDS", self.DEADLINE)):
+            patch = mock.patch.object(app_module, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.server = make_server(Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock()),
+                                  "127.0.0.1", 0)
+        self.host, self.port = self.server.server_address[:2]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def exchange(self, opening, drip=b"", gap=None):
+        """Send `opening`, then `drip` one piece every `gap` seconds; return (answer, seconds)."""
+        import socket
+        import threading
+        import time
+        sock = socket.create_connection((self.host, self.port), timeout=10)
+        stop = threading.Event()
+
+        def dripper():
+            for piece in drip:
+                if stop.wait(gap):
+                    return
+                try:
+                    sock.sendall(piece)
+                except OSError:
+                    return
+
+        started = time.monotonic()
+        sock.sendall(opening)
+        thread = threading.Thread(target=dripper, daemon=True)
+        thread.start()
+        chunks = []
+        try:
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                chunks.append(piece)
+        except socket.timeout:
+            self.fail("the connection was still open after 10 s")
+        except ConnectionResetError:
+            pass
+        finally:
+            elapsed = time.monotonic() - started
+            stop.set()
+            thread.join()
+            sock.close()
+        return b"".join(chunks), elapsed
+
+    def test_a_drip_fed_body_is_answered_408_at_the_deadline(self):
+        answer, elapsed = self.exchange(self.HEAD + b"Content-Length: 1000\r\n\r\n",
+                                        [b" "] * 1000, self.DRIP)
+        self.assertIn(b" 408 ", answer.split(b"\r\n")[0], answer[:200])
+        error = json.loads(answer.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(error["error"], "request_timeout")
+        self.assertRegex(error["message"], r"\(\d+ of 1000 bytes after 2\.\d s\)")
+        self.assertGreaterEqual(elapsed, self.DEADLINE - 0.1)
+        self.assertLess(elapsed, self.DEADLINE + 1.0)
+
+    def test_drip_fed_headers_are_closed_at_the_deadline(self):
+        answer, elapsed = self.exchange(self.HEAD, [b"X"] * 1000, self.DRIP)
+        self.assertEqual(answer, b"")
+        self.assertGreaterEqual(elapsed, self.DEADLINE - 0.1)
+        self.assertLess(elapsed, self.DEADLINE + 1.0)
+
+    def test_an_honest_body_in_a_few_quick_chunks_is_read_whole(self):
+        body = json.dumps({"block_hash": "A" * 64}).encode()
+        pieces = [body[:20], body[20:50], body[50:]]
+        answer, elapsed = self.exchange(
+            self.HEAD + b"Content-Length: %d\r\n\r\n" % len(body), pieces, 0.4)
+        # 404 not_found is the answer for this body to an unknown receipt: it was
+        # read whole and parsed, which a 400 bad_json or a 408 would deny.
+        self.assertIn(b" 404 ", answer.split(b"\r\n")[0], answer[:200])
+        self.assertEqual(json.loads(answer.split(b"\r\n\r\n", 1)[1])["error"], "not_found")
+        self.assertLess(elapsed, self.DEADLINE)
+
+
+class AResponseAfterHeadersThatFinishNearTheDeadline(unittest.TestCase):
+    """The deadline bounds the request; the response is written under the idle timeout.
+
+    The read side leaves the socket timeout at whatever was left of the deadline.
+    A GET (no body read at all) whose headers finished 0.2 s before the deadline
+    was written under a 0.2 s timeout, and a large response read at an ordinary
+    pace was cut off part way. Idle timeout 4 s, deadline 2 s, an 8 MB answer
+    read 512 KB every 0.1 s: it must arrive whole.
+    """
+
+    IDLE, DEADLINE, SIZE = 4.0, 2.0, 8_000_000
+
+    def setUp(self):
+        import threading
+        size = self.SIZE
+
+        class BigAnswer(Application):
+            def handle(self, method, path, query, headers, body):
+                return 200, {"blob": "x" * size}
+
+        self.server = make_server(BigAnswer(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock()),
+                                  "127.0.0.1", 0, request_timeout=self.IDLE,
+                                  request_deadline=self.DEADLINE)
+        self.host, self.port = self.server.server_address[:2]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_a_large_response_read_slowly_arrives_whole(self):
+        import socket
+        import time
+        sock = socket.create_connection((self.host, self.port), timeout=10)
+        try:
+            started = time.monotonic()
+            sock.sendall(b"GET /v1/receipts HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            while time.monotonic() - started < self.DEADLINE - 0.25:
+                sock.sendall(b"X-Pad: 1\r\n")
+                time.sleep(0.3)
+            sock.sendall(b"\r\n")
+            headers_done = time.monotonic() - started
+            chunks, since_pause = [], 0
+            while True:
+                piece = sock.recv(64 * 1024)
+                if not piece:
+                    break
+                chunks.append(piece)
+                since_pause += len(piece)
+                if since_pause >= 512 * 1024:
+                    since_pause = 0
+                    time.sleep(0.1)
+        finally:
+            sock.close()
+        self.assertLess(headers_done, self.DEADLINE)
+        answer = b"".join(chunks)
+        head, _, body = answer.partition(b"\r\n\r\n")
+        self.assertIn(b" 200 ", head.split(b"\r\n")[0])
+        declared = int(re.search(rb"Content-Length: (\d+)", head).group(1))
+        self.assertGreater(declared, self.SIZE)
+        self.assertEqual(len(body), declared, "the response was cut off")
+
+
+class TimeoutsOutOfRange(unittest.TestCase):
+    """A timeout of 0 makes the socket non-blocking; a deadline of 0 or less
+    switches the deadline off or drops every connection; a value above
+    MAX_TIMEOUT_SECONDS overflows socket.settimeout and drops every connection
+    too. All of them are refused, and so is anything that is not a number."""
+
+    BAD = (0, 0.0, -1, -0.5, float("nan"), float("inf"), True, "30",
+           1e10, 10**10, MAX_TIMEOUT_SECONDS + 1, 10**400, -10**400)
+
+    def test_make_server_refuses_them(self):
+        for bad in self.BAD:
+            for keyword in ("request_timeout", "request_deadline"):
+                with self.subTest(keyword=keyword, value=bad):
+                    with self.assertRaises(ValueError):
+                        make_server(Application(store=Store()), "127.0.0.1", 0, **{keyword: bad})
+
+    def test_make_server_accepts_positive_seconds(self):
+        server = make_server(Application(store=Store()), "127.0.0.1", 0,
+                             request_timeout=0.5, request_deadline=2)
+        server.server_close()
+        self.assertEqual((server.RequestHandlerClass.timeout,
+                          server.RequestHandlerClass.deadline), (0.5, 2))
+
+    def test_make_server_accepts_the_upper_bound(self):
+        """At MAX_TIMEOUT_SECONDS for both limits a real request is still answered."""
+        import threading
+        server = make_server(Application(store=Store()), "127.0.0.1", 0,
+                             request_timeout=MAX_TIMEOUT_SECONDS,
+                             request_deadline=MAX_TIMEOUT_SECONDS)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = "http://127.0.0.1:%d/v1/receipts" % server.server_address[1]
+            with urllib.request.urlopen(url, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_serve_py_refuses_them(self):
+        import contextlib
+        import importlib.util
+        import io
+        spec = importlib.util.spec_from_file_location("serve", os.path.join(ROOT, "serve.py"))
+        serve = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(serve)
+        for bad in ("0", "-1", "-0.5", "nan", "inf", "abc", "1e10", "1000000001"):
+            for flag in ("--request-timeout", "--request-deadline"):
+                with self.subTest(flag=flag, value=bad):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+                        serve.main([flag, bad, "--port", "0"])
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn(flag, stderr.getvalue())
+        self.assertEqual(serve.positive_seconds("1.5"), 1.5)
+        self.assertEqual(serve.positive_seconds("1e9"), MAX_TIMEOUT_SECONDS)
 
 
 GUARD_STEP = "No token, seed or key may be committed"

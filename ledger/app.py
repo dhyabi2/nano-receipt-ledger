@@ -8,9 +8,13 @@ answers and the second is the true one.
 """
 
 import hmac
+import io
 import json
+import math
 import os
 import re
+import socket
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core import Ledger
@@ -45,6 +49,27 @@ APPEND_ONLY_METHODS = ("PUT", "PATCH", "DELETE")
 #: by `core.MAX_REASON` - so a megabyte is already far more than any real caller
 #: sends, and a declared length beyond it is answered rather than read.
 MAX_BODY_BYTES = 1_000_000
+
+#: Seconds a single read or write on a connection may wait for progress. A
+#: caller whose Content-Length is larger than the body it sends otherwise holds
+#: a worker thread in `rfile.read` for as long as it keeps the socket open.
+REQUEST_TIMEOUT_SECONDS = 30
+
+#: Seconds the whole request - request line, headers and body - may take to
+#: arrive, counted from the moment the connection is accepted. The idle timeout
+#: alone is reset by every byte, so a caller dripping one byte every 29 seconds
+#: would hold a worker thread (and `ThreadingHTTPServer` has no thread cap)
+#: indefinitely. Past the deadline a body read is answered 408 and a request
+#: line or header read closes the connection, as the standard library does when
+#: its own timeout fires there. The server speaks HTTP/1.0, so a connection
+#: carries one request and is closed after the response.
+REQUEST_DEADLINE_SECONDS = 60
+
+#: The largest request timeout or deadline accepted, in seconds (about 31
+#: years). `socket.settimeout` raises OverflowError somewhere above 1e9 seconds
+#: on common platforms, so a larger value would pass startup and then drop
+#: every connection in `Handler.setup`.
+MAX_TIMEOUT_SECONDS = 1_000_000_000
 
 
 def tokens_match(supplied, expected):
@@ -260,9 +285,68 @@ def _utc_now():
 
 # -- the server ------------------------------------------------------------
 
+class _DeadlineReader(io.RawIOBase):
+    """The connection's read side, with each recv bounded by the request deadline.
+
+    Before every recv the socket timeout is set to the idle timeout or the time
+    left before the deadline, whichever is shorter; once the deadline has passed
+    a read raises `socket.timeout` without waiting at all.
+    """
+
+    def __init__(self, sock, idle, deadline_at):
+        self._sock = sock
+        self._idle = idle
+        self._deadline_at = deadline_at
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self._deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("the request deadline passed")
+        self._sock.settimeout(min(self._idle, remaining) if self._idle is not None else remaining)
+        return self._sock.recv_into(buffer)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "receipt-ledger"
     application = None
+    deadline = None
+
+    def setup(self):
+        super().setup()
+        self.started_at = time.monotonic()
+        if self.deadline is not None:
+            self.rfile.close()
+            self.rfile = io.BufferedReader(_DeadlineReader(
+                self.connection, self.timeout, self.started_at + self.deadline))
+
+    def _read_body(self, length):
+        """The body, read in pieces so a timeout can say how much arrived."""
+        chunks, received = [], 0
+        try:
+            while received < length:
+                piece = self.rfile.read1(length - received)
+                if not piece:
+                    # End of stream before the declared length: what arrived is a
+                    # prefix, not the body, and must not be parsed or recorded.
+                    raise _BodyIncomplete(received)
+                chunks.append(piece)
+                received += len(piece)
+        except socket.timeout:
+            raise _BodyTimeout(received) from None
+        return b"".join(chunks)
+
+    def send_response(self, code, message=None):
+        # Every response - ours, and the standard library's `send_error` - starts
+        # here, after the last read of the request. The read side leaves the
+        # socket timeout at whatever was left of the deadline, which can be a
+        # fraction of a second, so the response is written under the idle
+        # timeout instead: CPython's `sendall` counts that timeout across the
+        # whole write, so the entire response must be taken within it.
+        self.connection.settimeout(self.timeout)
+        super().send_response(code, message)
 
     def _content_length(self):
         """The declared body length, or a LedgerError naming what is wrong with it.
@@ -303,7 +387,20 @@ class Handler(BaseHTTPRequestHandler):
             length = self._content_length()
         except LedgerError as exc:
             return self._send(exc.status, exc.body())
-        raw = self.rfile.read(length) if length else b""
+        try:
+            raw = self._read_body(length) if length else b""
+        except _BodyTimeout as exc:
+            self.close_connection = True
+            return self._send(408, {
+                "error": "request_timeout",
+                "message": "the request body did not arrive in time (%d of %d bytes after %.1f s)"
+                           % (exc.received, length, time.monotonic() - self.started_at)})
+        except _BodyIncomplete as exc:
+            self.close_connection = True
+            return self._send(400, {
+                "error": "incomplete_body",
+                "message": "the request body was cut short (%d of %d bytes, then the connection closed)"
+                           % (exc.received, length)})
         try:
             body = json.loads(raw.decode("utf-8")) if raw else None
         except (ValueError, UnicodeDecodeError, RecursionError):
@@ -376,6 +473,47 @@ class Handler(BaseHTTPRequestHandler):
         pass  # a request log is one more place a token could end up
 
 
-def make_server(application, host="127.0.0.1", port=0):
-    handler = type("BoundHandler", (Handler,), {"application": application})
+def _positive_seconds(name, value):
+    # Both bounds are checked before math.isfinite: an int too large for a float
+    # (10**400 or -10**400) makes isfinite raise OverflowError instead of answering.
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not 0 < value <= MAX_TIMEOUT_SECONDS or not math.isfinite(value)):
+        raise ValueError("%s must be a finite number of seconds above zero and at most %d, got %r"
+                         % (name, MAX_TIMEOUT_SECONDS, value))
+    return value
+
+
+class _BodyTimeout(Exception):
+    def __init__(self, received):
+        super().__init__(received)
+        self.received = received
+
+
+class _BodyIncomplete(Exception):
+    """The caller closed its side before sending all of its Content-Length."""
+
+    def __init__(self, received):
+        super().__init__(received)
+        self.received = received
+
+
+def make_server(application, host="127.0.0.1", port=0,
+                request_timeout=None, request_deadline=None):
+    """`request_timeout` and `request_deadline` default to the module constants.
+
+    Both must be a finite number of seconds above zero and at most
+    `MAX_TIMEOUT_SECONDS`: a timeout of 0 would make the socket non-blocking, a
+    deadline of 0 or less would either switch the deadline off or drop every
+    connection, and a value too large for `socket.settimeout` would drop every
+    connection too.
+    """
+    request_timeout = _positive_seconds(
+        "request_timeout", REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout)
+    request_deadline = _positive_seconds(
+        "request_deadline", REQUEST_DEADLINE_SECONDS if request_deadline is None else request_deadline)
+    handler = type("BoundHandler", (Handler,), {
+        "application": application,
+        "timeout": request_timeout,
+        "deadline": request_deadline,
+    })
     return ThreadingHTTPServer((host, port), handler)
