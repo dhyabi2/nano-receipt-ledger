@@ -1415,6 +1415,44 @@ class ABodyShorterThanItsContentLength(unittest.TestCase):
         self.assertEqual(error["error"], "request_timeout")
         self.assertIn("did not arrive in time (2 of 100 bytes after", error["message"])
 
+    def test_a_body_cut_short_by_the_caller_closing_is_answered_400_and_not_recorded(self):
+        """EOF before Content-Length bytes is not a body: nothing is parsed or written.
+
+        A caller that shuts down its write side after a valid JSON prefix used to
+        get that prefix processed as the whole body - a 201 and a receipt in the
+        append-only ledger, from a request that never finished arriving.
+        """
+        import socket
+        body = json.dumps({
+            "kind": "work_settlement", "counterparty": "arion",
+            "counterparty_address": SELLER, "amount_xno": "0.050000",
+            "reason": "delivered the extraction job"}).encode()
+        sock = socket.create_connection((self.host, self.port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /v1/receipts HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"X-Ledger-Token: " + TOKEN.encode() + b"\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % (len(body) + 50) + body)
+            sock.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                chunks.append(piece)
+            answer = b"".join(chunks)
+        finally:
+            sock.close()
+        self.assertTrue(answer.startswith(b"HTTP/1."), "no HTTP response at all: %r" % answer[:120])
+        self.assertIn(b" 400 ", answer.split(b"\r\n")[0])
+        error = json.loads(answer.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(error["error"], "incomplete_body")
+        self.assertIn("%d of %d bytes, then the connection closed" % (len(body), len(body) + 50),
+                      error["message"])
+        self.assertEqual(self.server.RequestHandlerClass.application.store.receipts(), [])
+
 
 class ARequestDripFedPastItsDeadline(unittest.TestCase):
     """The idle timeout is reset by every byte; the deadline bounds the whole request.
@@ -1577,12 +1615,14 @@ class AResponseAfterHeadersThatFinishNearTheDeadline(unittest.TestCase):
         self.assertEqual(len(body), declared, "the response was cut off")
 
 
-class TimeoutsThatAreNotPositive(unittest.TestCase):
+class TimeoutsOutOfRange(unittest.TestCase):
     """A timeout of 0 makes the socket non-blocking; a deadline of 0 or less
-    switches the deadline off or drops every connection. Both are refused."""
+    switches the deadline off or drops every connection; a value above
+    MAX_TIMEOUT_SECONDS overflows socket.settimeout and drops every connection
+    too. All of them are refused, and so is anything that is not a number."""
 
     BAD = (0, 0.0, -1, -0.5, float("nan"), float("inf"), True, "30",
-           1e10, 10**10, MAX_TIMEOUT_SECONDS + 1)
+           1e10, 10**10, MAX_TIMEOUT_SECONDS + 1, 10**400)
 
     def test_make_server_refuses_them(self):
         for bad in self.BAD:
@@ -1599,13 +1639,20 @@ class TimeoutsThatAreNotPositive(unittest.TestCase):
                           server.RequestHandlerClass.deadline), (0.5, 2))
 
     def test_make_server_accepts_the_upper_bound(self):
-        import socket
+        """At MAX_TIMEOUT_SECONDS for both limits a real request is still answered."""
+        import threading
         server = make_server(Application(store=Store()), "127.0.0.1", 0,
                              request_timeout=MAX_TIMEOUT_SECONDS,
                              request_deadline=MAX_TIMEOUT_SECONDS)
-        server.server_close()
-        with socket.socket() as sock:
-            sock.settimeout(MAX_TIMEOUT_SECONDS)  # must not overflow
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = "http://127.0.0.1:%d/v1/receipts" % server.server_address[1]
+            with urllib.request.urlopen(url, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_serve_py_refuses_them(self):
         import contextlib

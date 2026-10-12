@@ -136,7 +136,9 @@ conversation.
   they trickle in. A body that is still incomplete when either limit passes - for
   instance one shorter than its `Content-Length` - is answered `408 request_timeout`,
   whose message says how many of the declared bytes arrived and after how long, and
-  the connection is closed. A request line or headers still incomplete at that point
+  the connection is closed. A body the caller stops short of its `Content-Length` by
+  closing its side of the connection is answered `400 incomplete_body` ("N of M
+  bytes, then the connection closed"); nothing that arrived is parsed or recorded. A request line or headers still incomplete at that point
   get no response: the connection is closed, as the standard library does. The
   deadline does not apply to the response: the whole response must be written
   within the idle timeout (30 seconds in total, not per write, since CPython's
@@ -189,7 +191,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 148 unit tests
+python3 -m unittest discover -s tests -v   # 149 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

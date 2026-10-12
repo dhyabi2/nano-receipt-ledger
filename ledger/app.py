@@ -329,7 +329,9 @@ class Handler(BaseHTTPRequestHandler):
             while received < length:
                 piece = self.rfile.read1(length - received)
                 if not piece:
-                    break
+                    # End of stream before the declared length: what arrived is a
+                    # prefix, not the body, and must not be parsed or recorded.
+                    raise _BodyIncomplete(received)
                 chunks.append(piece)
                 received += len(piece)
         except socket.timeout:
@@ -393,6 +395,12 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "request_timeout",
                 "message": "the request body did not arrive in time (%d of %d bytes after %.1f s)"
                            % (exc.received, length, time.monotonic() - self.started_at)})
+        except _BodyIncomplete as exc:
+            self.close_connection = True
+            return self._send(400, {
+                "error": "incomplete_body",
+                "message": "the request body was cut short (%d of %d bytes, then the connection closed)"
+                           % (exc.received, length)})
         try:
             body = json.loads(raw.decode("utf-8")) if raw else None
         except (ValueError, UnicodeDecodeError, RecursionError):
@@ -466,14 +474,24 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _positive_seconds(name, value):
+    # The bound is checked before math.isfinite: an int too large for a float
+    # (10**400) makes isfinite raise OverflowError instead of answering.
     if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or value <= 0 or value > MAX_TIMEOUT_SECONDS):
+            or not value <= MAX_TIMEOUT_SECONDS or not math.isfinite(value) or value <= 0):
         raise ValueError("%s must be a finite number of seconds above zero and at most %d, got %r"
                          % (name, MAX_TIMEOUT_SECONDS, value))
     return value
 
 
 class _BodyTimeout(Exception):
+    def __init__(self, received):
+        super().__init__(received)
+        self.received = received
+
+
+class _BodyIncomplete(Exception):
+    """The caller closed its side before sending all of its Content-Length."""
+
     def __init__(self, received):
         super().__init__(received)
         self.received = received
