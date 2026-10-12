@@ -1513,6 +1513,107 @@ class ARequestDripFedPastItsDeadline(unittest.TestCase):
         self.assertLess(elapsed, self.DEADLINE)
 
 
+class AResponseAfterHeadersThatFinishNearTheDeadline(unittest.TestCase):
+    """The deadline bounds the request; the response is written under the idle timeout.
+
+    The read side leaves the socket timeout at whatever was left of the deadline.
+    A GET (no body read at all) whose headers finished 0.2 s before the deadline
+    was written under a 0.2 s timeout, and a large response read at an ordinary
+    pace was cut off part way. Idle timeout 4 s, deadline 2 s, an 8 MB answer
+    read 512 KB every 0.1 s: it must arrive whole.
+    """
+
+    IDLE, DEADLINE, SIZE = 4.0, 2.0, 8_000_000
+
+    def setUp(self):
+        import threading
+        size = self.SIZE
+
+        class BigAnswer(Application):
+            def handle(self, method, path, query, headers, body):
+                return 200, {"blob": "x" * size}
+
+        self.server = make_server(BigAnswer(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock()),
+                                  "127.0.0.1", 0, request_timeout=self.IDLE,
+                                  request_deadline=self.DEADLINE)
+        self.host, self.port = self.server.server_address[:2]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_a_large_response_read_slowly_arrives_whole(self):
+        import socket
+        import time
+        sock = socket.create_connection((self.host, self.port), timeout=10)
+        try:
+            started = time.monotonic()
+            sock.sendall(b"GET /v1/receipts HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            while time.monotonic() - started < self.DEADLINE - 0.25:
+                sock.sendall(b"X-Pad: 1\r\n")
+                time.sleep(0.3)
+            sock.sendall(b"\r\n")
+            headers_done = time.monotonic() - started
+            chunks, since_pause = [], 0
+            while True:
+                piece = sock.recv(64 * 1024)
+                if not piece:
+                    break
+                chunks.append(piece)
+                since_pause += len(piece)
+                if since_pause >= 512 * 1024:
+                    since_pause = 0
+                    time.sleep(0.1)
+        finally:
+            sock.close()
+        self.assertLess(headers_done, self.DEADLINE)
+        answer = b"".join(chunks)
+        head, _, body = answer.partition(b"\r\n\r\n")
+        self.assertIn(b" 200 ", head.split(b"\r\n")[0])
+        declared = int(re.search(rb"Content-Length: (\d+)", head).group(1))
+        self.assertGreater(declared, self.SIZE)
+        self.assertEqual(len(body), declared, "the response was cut off")
+
+
+class TimeoutsThatAreNotPositive(unittest.TestCase):
+    """A timeout of 0 makes the socket non-blocking; a deadline of 0 or less
+    switches the deadline off or drops every connection. Both are refused."""
+
+    BAD = (0, 0.0, -1, -0.5, float("nan"), float("inf"), True, "30")
+
+    def test_make_server_refuses_them(self):
+        for bad in self.BAD:
+            for keyword in ("request_timeout", "request_deadline"):
+                with self.subTest(keyword=keyword, value=bad):
+                    with self.assertRaises(ValueError):
+                        make_server(Application(store=Store()), "127.0.0.1", 0, **{keyword: bad})
+
+    def test_make_server_accepts_positive_seconds(self):
+        server = make_server(Application(store=Store()), "127.0.0.1", 0,
+                             request_timeout=0.5, request_deadline=2)
+        server.server_close()
+        self.assertEqual((server.RequestHandlerClass.timeout,
+                          server.RequestHandlerClass.deadline), (0.5, 2))
+
+    def test_serve_py_refuses_them(self):
+        import contextlib
+        import importlib.util
+        import io
+        spec = importlib.util.spec_from_file_location("serve", os.path.join(ROOT, "serve.py"))
+        serve = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(serve)
+        for bad in ("0", "-1", "-0.5", "nan", "inf", "abc"):
+            for flag in ("--request-timeout", "--request-deadline"):
+                with self.subTest(flag=flag, value=bad):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+                        serve.main([flag, bad, "--port", "0"])
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn(flag, stderr.getvalue())
+        self.assertEqual(serve.positive_seconds("1.5"), 1.5)
+
+
 GUARD_STEP = "No token, seed or key may be committed"
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "test.yml")
 

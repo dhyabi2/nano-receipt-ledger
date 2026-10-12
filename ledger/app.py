@@ -10,6 +10,7 @@ answers and the second is the true one.
 import hmac
 import io
 import json
+import math
 import os
 import re
 import socket
@@ -298,7 +299,7 @@ class _DeadlineReader(io.RawIOBase):
         remaining = self._deadline_at - time.monotonic()
         if remaining <= 0:
             raise socket.timeout("the request deadline passed")
-        self._sock.settimeout(min(self._idle, remaining) if self._idle else remaining)
+        self._sock.settimeout(min(self._idle, remaining) if self._idle is not None else remaining)
         return self._sock.recv_into(buffer)
 
 
@@ -310,7 +311,7 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.started_at = time.monotonic()
-        if self.deadline:
+        if self.deadline is not None:
             self.rfile.close()
             self.rfile = io.BufferedReader(_DeadlineReader(
                 self.connection, self.timeout, self.started_at + self.deadline))
@@ -327,11 +328,17 @@ class Handler(BaseHTTPRequestHandler):
                 received += len(piece)
         except socket.timeout:
             raise _BodyTimeout(received) from None
-        finally:
-            # The response is written under the idle timeout alone, so an
-            # honest caller is never cut off because its request was slow.
-            self.connection.settimeout(self.timeout)
         return b"".join(chunks)
+
+    def send_response(self, code, message=None):
+        # Every response - ours, and the standard library's `send_error` - starts
+        # here, after the last read of the request. The read side leaves the
+        # socket timeout at whatever was left of the deadline, which can be a
+        # fraction of a second, so the response is written under the idle
+        # timeout instead: CPython's `sendall` counts that timeout across the
+        # whole write, so the entire response must be taken within it.
+        self.connection.settimeout(self.timeout)
+        super().send_response(code, message)
 
     def _content_length(self):
         """The declared body length, or a LedgerError naming what is wrong with it.
@@ -452,6 +459,13 @@ class Handler(BaseHTTPRequestHandler):
         pass  # a request log is one more place a token could end up
 
 
+def _positive_seconds(name, value):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError("%s must be a finite number of seconds above zero, got %r" % (name, value))
+    return value
+
+
 class _BodyTimeout(Exception):
     def __init__(self, received):
         super().__init__(received)
@@ -460,10 +474,19 @@ class _BodyTimeout(Exception):
 
 def make_server(application, host="127.0.0.1", port=0,
                 request_timeout=None, request_deadline=None):
-    """`request_timeout` and `request_deadline` default to the module constants."""
+    """`request_timeout` and `request_deadline` default to the module constants.
+
+    Both must be a finite number of seconds above zero: a timeout of 0 would make
+    the socket non-blocking, and a deadline of 0 or less would either switch the
+    deadline off or drop every connection.
+    """
+    request_timeout = _positive_seconds(
+        "request_timeout", REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout)
+    request_deadline = _positive_seconds(
+        "request_deadline", REQUEST_DEADLINE_SECONDS if request_deadline is None else request_deadline)
     handler = type("BoundHandler", (Handler,), {
         "application": application,
-        "timeout": REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout,
-        "deadline": REQUEST_DEADLINE_SECONDS if request_deadline is None else request_deadline,
+        "timeout": request_timeout,
+        "deadline": request_deadline,
     })
     return ThreadingHTTPServer((host, port), handler)
