@@ -17,20 +17,21 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ledger"))
 
-from app import (Application, REQUEST_DEADLINE_SECONDS,  # noqa: E402
-                 REQUEST_TIMEOUT_SECONDS, make_server)
+from app import (Application, MAX_TIMEOUT_SECONDS,  # noqa: E402
+                 REQUEST_DEADLINE_SECONDS, REQUEST_TIMEOUT_SECONDS, make_server)
 from node import NanoNode  # noqa: E402
 from store import Store  # noqa: E402
 
 
 def positive_seconds(text):
-    """argparse type: a finite number of seconds above zero."""
+    """argparse type: a finite number of seconds above zero, at most MAX_TIMEOUT_SECONDS."""
     try:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError("%r is not a number of seconds" % text) from None
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("%r must be a finite number of seconds above zero" % text)
+    if not math.isfinite(value) or value <= 0 or value > MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError("%r must be a finite number of seconds above zero "
+                                         "and at most %d" % (text, MAX_TIMEOUT_SECONDS))
     return value
 
 

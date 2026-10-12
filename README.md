@@ -144,7 +144,8 @@ conversation.
   response too slowly is cut off. The server speaks HTTP/1.0: every connection
   carries one request and is closed after its response. Both values can be changed
   with `serve.py --request-timeout SECONDS --request-deadline SECONDS`; each must
-  be a finite number of seconds above zero, and anything else is refused at startup.
+  be a finite number of seconds above zero and at most 1000000000 (larger values
+  overflow `socket.settimeout`), and anything else is refused at startup.
 - A node value echoed into a `409 block_mismatch` detail (`subtype`,
   `destination`, `amount`) is shown exactly when it is a string of up to 128
   characters, so any Nano address (65 characters as `nano_`, 64 as `xrb_`) is shown
@@ -188,7 +189,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 147 unit tests
+python3 -m unittest discover -s tests -v   # 148 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.join(ROOT, "ledger"))
 
 import app as app_module  # noqa: E402
 import node as node_module  # noqa: E402
-from app import Application, ROUTES, make_server, tokens_match  # noqa: E402
+from app import (Application, MAX_TIMEOUT_SECONDS, ROUTES,  # noqa: E402
+                 make_server, tokens_match)
 from core import Ledger  # noqa: E402
 from errors import LedgerError  # noqa: E402
 from money import AmountError, format_xno, parse_xno  # noqa: E402
@@ -1580,7 +1581,8 @@ class TimeoutsThatAreNotPositive(unittest.TestCase):
     """A timeout of 0 makes the socket non-blocking; a deadline of 0 or less
     switches the deadline off or drops every connection. Both are refused."""
 
-    BAD = (0, 0.0, -1, -0.5, float("nan"), float("inf"), True, "30")
+    BAD = (0, 0.0, -1, -0.5, float("nan"), float("inf"), True, "30",
+           1e10, 10**10, MAX_TIMEOUT_SECONDS + 1)
 
     def test_make_server_refuses_them(self):
         for bad in self.BAD:
@@ -1596,6 +1598,15 @@ class TimeoutsThatAreNotPositive(unittest.TestCase):
         self.assertEqual((server.RequestHandlerClass.timeout,
                           server.RequestHandlerClass.deadline), (0.5, 2))
 
+    def test_make_server_accepts_the_upper_bound(self):
+        import socket
+        server = make_server(Application(store=Store()), "127.0.0.1", 0,
+                             request_timeout=MAX_TIMEOUT_SECONDS,
+                             request_deadline=MAX_TIMEOUT_SECONDS)
+        server.server_close()
+        with socket.socket() as sock:
+            sock.settimeout(MAX_TIMEOUT_SECONDS)  # must not overflow
+
     def test_serve_py_refuses_them(self):
         import contextlib
         import importlib.util
@@ -1603,7 +1614,7 @@ class TimeoutsThatAreNotPositive(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("serve", os.path.join(ROOT, "serve.py"))
         serve = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(serve)
-        for bad in ("0", "-1", "-0.5", "nan", "inf", "abc"):
+        for bad in ("0", "-1", "-0.5", "nan", "inf", "abc", "1e10", "1000000001"):
             for flag in ("--request-timeout", "--request-deadline"):
                 with self.subTest(flag=flag, value=bad):
                     stderr = io.StringIO()
@@ -1612,6 +1623,7 @@ class TimeoutsThatAreNotPositive(unittest.TestCase):
                     self.assertEqual(caught.exception.code, 2)
                     self.assertIn(flag, stderr.getvalue())
         self.assertEqual(serve.positive_seconds("1.5"), 1.5)
+        self.assertEqual(serve.positive_seconds("1e9"), MAX_TIMEOUT_SECONDS)
 
 
 GUARD_STEP = "No token, seed or key may be committed"

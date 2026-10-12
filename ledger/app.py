@@ -65,6 +65,12 @@ REQUEST_TIMEOUT_SECONDS = 30
 #: carries one request and is closed after the response.
 REQUEST_DEADLINE_SECONDS = 60
 
+#: The largest request timeout or deadline accepted, in seconds (about 31
+#: years). `socket.settimeout` raises OverflowError somewhere above 1e9 seconds
+#: on common platforms, so a larger value would pass startup and then drop
+#: every connection in `Handler.setup`.
+MAX_TIMEOUT_SECONDS = 1_000_000_000
+
 
 def tokens_match(supplied, expected):
     """Constant-time token comparison. Called directly by the auth test."""
@@ -461,8 +467,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def _positive_seconds(name, value):
     if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or value <= 0):
-        raise ValueError("%s must be a finite number of seconds above zero, got %r" % (name, value))
+            or not math.isfinite(value) or value <= 0 or value > MAX_TIMEOUT_SECONDS):
+        raise ValueError("%s must be a finite number of seconds above zero and at most %d, got %r"
+                         % (name, MAX_TIMEOUT_SECONDS, value))
     return value
 
 
@@ -476,9 +483,11 @@ def make_server(application, host="127.0.0.1", port=0,
                 request_timeout=None, request_deadline=None):
     """`request_timeout` and `request_deadline` default to the module constants.
 
-    Both must be a finite number of seconds above zero: a timeout of 0 would make
-    the socket non-blocking, and a deadline of 0 or less would either switch the
-    deadline off or drop every connection.
+    Both must be a finite number of seconds above zero and at most
+    `MAX_TIMEOUT_SECONDS`: a timeout of 0 would make the socket non-blocking, a
+    deadline of 0 or less would either switch the deadline off or drop every
+    connection, and a value too large for `socket.settimeout` would drop every
+    connection too.
     """
     request_timeout = _positive_seconds(
         "request_timeout", REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout)
