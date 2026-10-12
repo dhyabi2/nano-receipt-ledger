@@ -474,10 +474,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _positive_seconds(name, value):
-    # The bound is checked before math.isfinite: an int too large for a float
-    # (10**400) makes isfinite raise OverflowError instead of answering.
+    # Both bounds are checked before math.isfinite: an int too large for a float
+    # (10**400 or -10**400) makes isfinite raise OverflowError instead of answering.
     if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not value <= MAX_TIMEOUT_SECONDS or not math.isfinite(value) or value <= 0):
+            or not 0 < value <= MAX_TIMEOUT_SECONDS or not math.isfinite(value)):
         raise ValueError("%s must be a finite number of seconds above zero and at most %d, got %r"
                          % (name, MAX_TIMEOUT_SECONDS, value))
     return value

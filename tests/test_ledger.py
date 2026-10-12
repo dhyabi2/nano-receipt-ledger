@@ -1622,7 +1622,7 @@ class TimeoutsOutOfRange(unittest.TestCase):
     too. All of them are refused, and so is anything that is not a number."""
 
     BAD = (0, 0.0, -1, -0.5, float("nan"), float("inf"), True, "30",
-           1e10, 10**10, MAX_TIMEOUT_SECONDS + 1, 10**400)
+           1e10, 10**10, MAX_TIMEOUT_SECONDS + 1, 10**400, -10**400)
 
     def test_make_server_refuses_them(self):
         for bad in self.BAD:
