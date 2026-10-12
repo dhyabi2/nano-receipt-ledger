@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import re
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core import Ledger
@@ -45,6 +46,11 @@ APPEND_ONLY_METHODS = ("PUT", "PATCH", "DELETE")
 #: by `core.MAX_REASON` - so a megabyte is already far more than any real caller
 #: sends, and a declared length beyond it is answered rather than read.
 MAX_BODY_BYTES = 1_000_000
+
+#: Seconds a connection may sit idle mid-request before it is given up on. A
+#: caller whose Content-Length is larger than the body it sends otherwise holds
+#: a worker thread in `rfile.read` for as long as it keeps the socket open.
+REQUEST_TIMEOUT_SECONDS = 30
 
 
 def tokens_match(supplied, expected):
@@ -303,7 +309,13 @@ class Handler(BaseHTTPRequestHandler):
             length = self._content_length()
         except LedgerError as exc:
             return self._send(exc.status, exc.body())
-        raw = self.rfile.read(length) if length else b""
+        try:
+            raw = self.rfile.read(length) if length else b""
+        except socket.timeout:
+            self.close_connection = True
+            return self._send(408, {
+                "error": "request_timeout",
+                "message": "the body was shorter than its Content-Length of %d bytes" % length})
         try:
             body = json.loads(raw.decode("utf-8")) if raw else None
         except (ValueError, UnicodeDecodeError, RecursionError):
@@ -377,5 +389,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(application, host="127.0.0.1", port=0):
-    handler = type("BoundHandler", (Handler,), {"application": application})
+    handler = type("BoundHandler", (Handler,),
+                   {"application": application, "timeout": REQUEST_TIMEOUT_SECONDS})
     return ThreadingHTTPServer((host, port), handler)

@@ -172,7 +172,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 139 unit tests
+python3 -m unittest discover -s tests -v   # 140 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 

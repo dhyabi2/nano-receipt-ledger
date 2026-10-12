@@ -1363,6 +1363,56 @@ class AMalformedContentLength(unittest.TestCase):
         self.assert_json_error(self.raw_request(b"2"), 404, "not_found")
 
 
+class ABodyShorterThanItsContentLength(unittest.TestCase):
+    """A caller that declares more bytes than it sends must get a 408, not a hung worker.
+
+    `rfile.read(length)` had no socket timeout, so `Content-Length: 100` with a
+    two-byte body held a worker thread for as long as the caller kept the
+    socket open. Over a real socket: the client sends the short body and waits.
+    """
+
+    def setUp(self):
+        import threading
+        from unittest import mock
+        patch = mock.patch.object(app_module, "REQUEST_TIMEOUT_SECONDS", 0.5, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.server = make_server(Application(store=Store(), node=FakeNode(), token=TOKEN, clock=Clock()),
+                                  "127.0.0.1", 0)
+        self.host, self.port = self.server.server_address[:2]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_a_short_body_is_answered_408_and_the_connection_closed(self):
+        import socket
+        sock = socket.create_connection((self.host, self.port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /v1/receipts/rcpt_0000000000000000/attach-block HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"X-Ledger-Token: " + TOKEN.encode() + b"\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 100\r\n\r\n{}")
+            chunks = []
+            try:
+                while True:
+                    piece = sock.recv(4096)
+                    if not piece:
+                        break
+                    chunks.append(piece)
+            except socket.timeout:
+                self.fail("the request never returned: a worker is still waiting for 98 bytes")
+            answer = b"".join(chunks)
+        finally:
+            sock.close()
+        self.assertTrue(answer.startswith(b"HTTP/1."), "no HTTP response at all: %r" % answer[:120])
+        self.assertIn(b" 408 ", answer.split(b"\r\n")[0])
+        self.assertEqual(json.loads(answer.split(b"\r\n\r\n", 1)[1])["error"], "request_timeout")
+
+
 GUARD_STEP = "No token, seed or key may be committed"
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "test.yml")
 
