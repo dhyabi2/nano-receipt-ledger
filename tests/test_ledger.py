@@ -1222,6 +1222,37 @@ class AReplyThatIsNotHTTP(NodeStubs, unittest.TestCase):
                               + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
         self.assertTrue(node.block_info(block())["confirmed"])
 
+    def test_a_body_cut_short_of_its_content_length_is_held(self):
+        # The body sent is a complete, valid, matching block_info answer; only
+        # the Content-Length says more was coming before the node hung up.
+        # `read(amt)` returned those short bytes without complaint, so the
+        # truncated reply was parsed and the receipt was recorded as paid.
+        body = self.reply()
+        self.assert_held(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n"
+                         % (len(body) + 1000) + body)
+
+    def test_a_body_one_byte_short_of_its_content_length_is_held(self):
+        body = self.reply()
+        self.assert_held(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n"
+                         % (len(body) + 1) + body)
+
+    def test_a_body_that_matches_its_content_length_is_still_read(self):
+        body = self.reply()
+        node = self.serve_raw(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n"
+                              % len(body) + body)
+        self.assertTrue(node.block_info(block())["confirmed"])
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertEqual(status, 200, answer)
+        self.assertTrue(stored["confirmed"])
+
+    def test_a_chunked_reply_is_read_over_http_too(self):
+        body = self.reply()
+        node = self.serve_raw(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                              + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertEqual(status, 200, answer)
+        self.assertTrue(stored["confirmed"])
+
 
 class AmountXnoAtTheDoor(Base):
     """`parse_xno` edge cases: the 128-bit ceiling, script digits, padding."""

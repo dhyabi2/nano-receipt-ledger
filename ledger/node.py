@@ -94,6 +94,17 @@ class NanoNode:
         try:
             with _opener().open(request, timeout=self.timeout) as response:
                 body = response.read(MAX_REPLY_BYTES + 1)
+                # `read(amt)` does not raise IncompleteRead when the node
+                # hangs up before its Content-Length: it returns the short
+                # bytes, and a short body that happens to be complete JSON
+                # would be taken as the answer. `length` is what is still
+                # owed; any left after a read that stopped under the limit
+                # means the body was cut short. A chunked reply has no
+                # `length` (None) and reports its own truncation.
+                expected = response.length
+                if (len(body) <= MAX_REPLY_BYTES and isinstance(expected, int)
+                        and expected > 0):
+                    raise http.client.IncompleteRead(body, expected)
             if len(body) > MAX_REPLY_BYTES:
                 raise NodeError(
                     "%s answered %s with more than %d bytes; a block_info reply is "
