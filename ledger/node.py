@@ -14,6 +14,11 @@ import urllib.request
 # kilobytes; one mebibyte is generous and still bounded.
 MAX_REPLY_BYTES = 1024 * 1024
 
+# Sent on every node request. Without it urllib sends `Python-urllib/3.x`,
+# and rpc.nano.to answers that with 403, so serve.py could not use the
+# public node at all: every attach was a 503 hold.
+USER_AGENT = "nano-receipt-ledger/1 (+https://github.com/dhyabi2/nano-receipt-ledger)"
+
 
 class NodeError(Exception):
     """This client could not get an answer out of the node.
@@ -61,7 +66,7 @@ class NanoNode:
         request = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
             method="POST",
         )
         # A node on the far end of a socket fails in ways `normalise` below
@@ -94,6 +99,17 @@ class NanoNode:
         try:
             with _opener().open(request, timeout=self.timeout) as response:
                 body = response.read(MAX_REPLY_BYTES + 1)
+                # `read(amt)` does not raise IncompleteRead when the node
+                # hangs up before its Content-Length: it returns the short
+                # bytes, and a short body that happens to be complete JSON
+                # would be taken as the answer. `length` is what is still
+                # owed; any left after a read that stopped under the limit
+                # means the body was cut short. A chunked reply has no
+                # `length` (None) and reports its own truncation.
+                expected = response.length
+                if (len(body) <= MAX_REPLY_BYTES and isinstance(expected, int)
+                        and expected > 0):
+                    raise http.client.IncompleteRead(body, expected)
             if len(body) > MAX_REPLY_BYTES:
                 raise NodeError(
                     "%s answered %s with more than %d bytes; a block_info reply is "
