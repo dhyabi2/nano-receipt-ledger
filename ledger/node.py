@@ -113,8 +113,8 @@ class NanoNode:
 def normalise(answer):
     """Reduce a node's block_info answer to the five facts the ledger checks.
 
-    Raises NodeError for an answer that names a block whose `contents` cannot
-    be read. `block_info` is asked with `json_block: "true"`; an endpoint that
+    Raises NodeError for an answer that is not a JSON object at all, and for
+    one that names a block whose `contents` cannot be read. `block_info` is asked with `json_block: "true"`; an endpoint that
     ignores the flag answers `contents` as an opaque JSON *string*, and
     `"...".get("link_as_account")` is an AttributeError - raised outside
     `rpc`'s own guard, so it went past the HTTP layer, which answers only
@@ -129,7 +129,26 @@ def normalise(answer):
     into a different verdict - a mismatch is the end of that receipt. 503
     `node_unavailable` tells the caller to ask again, which is the truth.
     """
-    if not isinstance(answer, dict) or "error" in answer:
+    if not isinstance(answer, dict):
+        # Valid JSON that is not an object at all - a proxy's `[]`, a bare
+        # string, a number, `null`. This used to be folded into the
+        # not-found answer below, so the caller was told "the node does not
+        # know block X" (404 block_not_found) although NOTHING about the
+        # block was read. That is the same wrong verdict the `contents`
+        # case above argues against, one step earlier: unknown reported as
+        # a fact.
+        #
+        # The 2026-10-11 audit deliberately left the `error` FIELD as a
+        # known limitation, because telling a real not-found from a
+        # transient refusal needs each endpoint's error strings. That
+        # reasoning does not reach here: a reply that is not an object
+        # carries no error string to interpret, so there is nothing to
+        # collect and no ambiguity to resolve. It is unreadable, full stop.
+        raise NodeError(
+            "the endpoint's reply is %s, not a JSON object, so it is not a "
+            "node's block_info answer and says nothing about this block"
+            % type(answer).__name__)
+    if "error" in answer:
         return {"found": False, "confirmed": False, "subtype": None,
                 "destination": None, "amount_raw": None}
     contents = answer.get("contents")

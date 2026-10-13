@@ -109,14 +109,18 @@ conversation.
   connection, a timeout, a reply that is not well-formed HTTP (a garbage status
   line, an over-long or excessive header, a broken or truncated chunked body), a
   proxy's HTML page, a body that is not JSON, nested too deeply to parse, or over
-  1 MiB, or a reply that names a block but whose
+  1 MiB, a reply that is valid JSON but not an object at all (a proxy's `[]`, a bare
+  string, a number, `null`), or a reply that names a block but whose
   `contents` is not an object (for instance an opaque string, because the endpoint
   ignored `json_block`) → `503 node_unavailable`, and **nothing is written**, so
   the receipt is still pending and the retry is safe. This is a hold, never a
   verdict: no block was judged, so none was refused. A reply that is readable JSON
   carrying an `error` field — including a rate limit or other transient refusal —
   is **not** in this list: it is still answered `404 block_not_found`. Nothing is
-  written then either, but the code does not say "retry".
+  written then either, but the code does not say "retry". That one stays a 404
+  because telling a real not-found from a transient refusal needs each endpoint's
+  error strings; a reply that is not an object carries no error string to read, so
+  it is simply unreadable and holds.
 - The node **timeout** (10 seconds) applies to each connect attempt and each
   read, as on `main`; it is not a deadline for the whole RPC. Every address the
   node's name resolves to is tried in turn by the standard library, each attempt
@@ -191,7 +195,7 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 149 unit tests
+python3 -m unittest discover -s tests -v   # 151 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 ```
 
