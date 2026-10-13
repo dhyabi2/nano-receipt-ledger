@@ -2671,5 +2671,47 @@ class AVeryLongWholePart(unittest.TestCase):
                          "account can hold: %r" % (sent[:40] + "...",))
 
 
+
+class TheNodeIsToldWhoIsAsking(NodeStubs, unittest.TestCase):
+    """Every node request names this client in its User-Agent.
+
+    Without one, urllib sends `Python-urllib/3.x`, and rpc.nano.to answers
+    that with 403: serve.py could not use the public node at all, and every
+    attach was a 503 hold for a reason the reply never named.
+    """
+
+    def test_a_block_info_request_carries_this_clients_user_agent(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        seen = []
+        body = self.reply()
+
+        class Stub(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.headers.get("User-Agent"))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        stub = HTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        self.addCleanup(stub.server_close)
+        self.addCleanup(stub.shutdown)
+        node = node_module.NanoNode("http://127.0.0.1:%d" % stub.server_address[1], timeout=10)
+        self.assertTrue(node.block_info(block())["confirmed"])
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(len(seen), 2)
+        for agent in seen:
+            self.assertEqual(agent, node_module.USER_AGENT)
+            self.assertTrue(agent.startswith("nano-receipt-ledger/"), agent)
+
+
 if __name__ == "__main__":
     unittest.main()
