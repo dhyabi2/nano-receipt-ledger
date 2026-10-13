@@ -734,6 +734,43 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
             {"found": True, "confirmed": True, "subtype": "send",
              "destination": SELLER, "amount_raw": "10"})
 
+    def test_normalise_holds_on_a_reply_that_is_not_a_json_object(self):
+        """A reply that is not an object was answered 404 block_not_found.
+
+        `[]`, a bare string, a number and `null` all used to fold into the
+        not-found answer, so the caller was told "the node does not know
+        block X" although NOTHING about the block was read. A public endpoint
+        behind a proxy answers 200 with its own JSON - a status page, a
+        rate-limit envelope - far more often than it answers with HTML.
+
+        This is the same wrong verdict the `contents` case argues against,
+        one step earlier: unknown reported as a fact. The 2026-10-11 note
+        left the `error` FIELD as a known limitation because telling a real
+        not-found from a transient refusal needs each endpoint's error
+        strings; a reply that is not an object carries no error string to
+        interpret, so that reasoning does not reach this case.
+        """
+        for answer in ([], ["error"], "ok", "error", 1, None, True, 0.5):
+            with self.subTest(answer=answer):
+                with self.assertRaises(node_module.NodeError):
+                    node_module.normalise(answer)
+
+    def test_a_node_error_field_is_still_a_not_found_and_not_a_hold(self):
+        """Control: the guard above must not take the known limitation away.
+
+        A node's own `{"error": ...}` object is still read as a not-found and
+        still answered 404. That is the 2026-10-11 decision and it stands;
+        only the shape that carries no error string at all changed.
+        """
+        self.assertEqual(
+            node_module.normalise({"error": "Block not found"}),
+            {"found": False, "confirmed": False, "subtype": None,
+             "destination": None, "amount_raw": None})
+        self.assertEqual(
+            node_module.normalise({"error": "Too many requests"}),
+            {"found": False, "confirmed": False, "subtype": None,
+             "destination": None, "amount_raw": None})
+
     def test_a_send_shaped_action_still_raises_loudly(self):
         """The fix must not turn the repository's own tripwire into a 503.
 
