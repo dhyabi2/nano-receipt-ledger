@@ -718,11 +718,12 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
     def test_normalise_still_reads_every_answer_it_read_before(self):
         """Control: the two shapes that worked are untouched, field for field.
 
-        A node error answer is still a not-found, and a well-formed answer still
-        yields the same five facts. The one verdict that did change is for a
-        reply with `contents` missing, null or not an object: it was a terminal
-        409 (block_unconfirmed or block_mismatch) and is now the retryable 503
-        hold above.
+        A node error answer that SAYS not-found is still a not-found, and a
+        well-formed answer still yields the same five facts. The one verdict
+        that did change is for a reply with `contents` missing, null or not an
+        object: it was a terminal 409 (block_unconfirmed or block_mismatch) and
+        is now the retryable 503 hold above. (Any OTHER error string is now
+        that same hold too - see ANodeErrorThatIsNotANotFound.)
         """
         self.assertEqual(
             node_module.normalise({"error": "Block not found"}),
@@ -745,31 +746,32 @@ class ANodeThatDoesNotAnswer(unittest.TestCase):
 
         This is the same wrong verdict the `contents` case argues against,
         one step earlier: unknown reported as a fact. The 2026-10-11 note
-        left the `error` FIELD as a known limitation because telling a real
-        not-found from a transient refusal needs each endpoint's error
-        strings; a reply that is not an object carries no error string to
-        interpret, so that reasoning does not reach this case.
+        left the `error` FIELD as a known limitation on the same reasoning,
+        and that limitation is now closed as well: only an error that says
+        "not found" is read as one.
         """
         for answer in ([], ["error"], "ok", "error", 1, None, True, 0.5):
             with self.subTest(answer=answer):
                 with self.assertRaises(node_module.NodeError):
                     node_module.normalise(answer)
 
-    def test_a_node_error_field_is_still_a_not_found_and_not_a_hold(self):
-        """Control: the guard above must not take the known limitation away.
+    def test_only_a_not_found_error_is_read_as_a_not_found(self):
+        """The error FIELD is split on what it says, not folded wholesale.
 
-        A node's own `{"error": ...}` object is still read as a not-found and
-        still answered 404. That is the 2026-10-11 decision and it stands;
-        only the shape that carries no error string at all changed.
+        `{"error": "Block not found"}` is evidence the block is absent and
+        keeps its 404. `{"error": "Too many requests"}` is not evidence of
+        anything about the block, so it is the same 503 hold as a reply that
+        carries no error string at all - see ANodeErrorThatIsNotANotFound,
+        which owns this behaviour. The 2026-10-11 note treated the whole
+        field as a known limitation on the grounds that the two could not be
+        told apart; the one string every Nano node uses tells them apart.
         """
         self.assertEqual(
             node_module.normalise({"error": "Block not found"}),
             {"found": False, "confirmed": False, "subtype": None,
              "destination": None, "amount_raw": None})
-        self.assertEqual(
-            node_module.normalise({"error": "Too many requests"}),
-            {"found": False, "confirmed": False, "subtype": None,
-             "destination": None, "amount_raw": None})
+        with self.assertRaises(node_module.NodeError):
+            node_module.normalise({"error": "Too many requests"})
 
     def test_a_send_shaped_action_still_raises_loudly(self):
         """The fix must not turn the repository's own tripwire into a 503.
@@ -2642,3 +2644,57 @@ class AVeryLongWholePart(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ANodeErrorThatIsNotANotFound(NodeStubs, unittest.TestCase):
+    """A node that says anything but "not found" has not said the block is absent.
+
+    `normalise` folded EVERY `{"error": ...}` answer into the not-found reply,
+    so a node answering `{"error": "Too many requests"}` - a public endpoint
+    rate-limiting the read - was reported as `404 block_not_found`, "the node
+    does not know block X". Nothing about the block had been read. That is the
+    same "unknown reported as a fact" the non-object guard one case over exists
+    to prevent, and the reason given for leaving it alone (that telling a real
+    not-found from a transient refusal needs each endpoint's error strings) is
+    answered by the one string every Nano node uses: `block_info` says "Block
+    not found", and `nano-settlement-verify`'s `nano_claim.py` already splits
+    on exactly that.
+
+    It matters because the verdicts are not interchangeable to the caller. This
+    is the endpoint an agent calls to prove its XNO settlement; a 404 says the
+    payment does not exist and there is nothing to retry, while the truth -
+    the node could not be read - is the 503 hold that says ask again.
+    """
+
+    TRANSIENT = ("Too many requests", "RPC control is disabled",
+                 "Bad hash number", "Unable to parse JSON", "")
+
+    def test_a_transient_node_error_is_a_hold_not_a_not_found(self):
+        for message in self.TRANSIENT:
+            with self.subTest(error=message):
+                with self.assertRaises(node_module.NodeError) as caught:
+                    node_module.normalise({"error": message})
+                self.assertIn("says nothing about this block", str(caught.exception))
+
+    def test_block_not_found_is_still_a_not_found(self):
+        """The one answer that IS evidence of absence keeps its verdict."""
+        for message in ("Block not found", "block not found", "Account not found"):
+            with self.subTest(error=message):
+                self.assertEqual(
+                    node_module.normalise({"error": message}),
+                    {"found": False, "confirmed": False, "subtype": None,
+                     "destination": None, "amount_raw": None})
+
+    def test_a_rate_limited_read_is_503_over_http_and_records_nothing(self):
+        """End to end: the agent is told to retry, not that it never paid."""
+        node = self.serve_node(json.dumps({"error": "Too many requests"}).encode("utf-8"))
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+        self.assertIn("could not be read", answer["message"])
+
+    def test_a_genuine_not_found_is_still_404_over_http(self):
+        node = self.serve_node(json.dumps({"error": "Block not found"}).encode("utf-8"))
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 404, answer)
+        self.assertEqual(answer["error"], "block_not_found")

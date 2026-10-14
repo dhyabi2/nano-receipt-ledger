@@ -110,11 +110,18 @@ class NanoNode:
             {"action": "block_info", "json_block": "true", "hash": block_hash}))
 
 
+def _shown(value, width=200):
+    """The node's own error text, clipped, for a message the caller reads."""
+    text = value if isinstance(value, str) else repr(value)
+    return text if len(text) <= width else text[:width] + "..."
+
+
 def normalise(answer):
     """Reduce a node's block_info answer to the five facts the ledger checks.
 
-    Raises NodeError for an answer that is not a JSON object at all, and for
-    one that names a block whose `contents` cannot be read. `block_info` is asked with `json_block: "true"`; an endpoint that
+    Raises NodeError for an answer that is not a JSON object at all, for one
+    that names a block whose `contents` cannot be read, and for a node `error`
+    that does not itself say the block was not found. `block_info` is asked with `json_block: "true"`; an endpoint that
     ignores the flag answers `contents` as an opaque JSON *string*, and
     `"...".get("link_as_account")` is an AttributeError - raised outside
     `rpc`'s own guard, so it went past the HTTP layer, which answers only
@@ -138,19 +145,41 @@ def normalise(answer):
         # case above argues against, one step earlier: unknown reported as
         # a fact.
         #
-        # The 2026-10-11 audit deliberately left the `error` FIELD as a
-        # known limitation, because telling a real not-found from a
-        # transient refusal needs each endpoint's error strings. That
-        # reasoning does not reach here: a reply that is not an object
-        # carries no error string to interpret, so there is nothing to
-        # collect and no ambiguity to resolve. It is unreadable, full stop.
+        # The 2026-10-11 audit left the `error` FIELD as a known limitation
+        # on the grounds that telling a real not-found from a transient
+        # refusal needs each endpoint's error strings. That reasoning never
+        # reached here - a reply that is not an object carries no error
+        # string to interpret - and it no longer holds below either: one
+        # string does it, so the two cases now answer alike.
         raise NodeError(
             "the endpoint's reply is %s, not a JSON object, so it is not a "
             "node's block_info answer and says nothing about this block"
             % type(answer).__name__)
     if "error" in answer:
-        return {"found": False, "confirmed": False, "subtype": None,
-                "destination": None, "amount_raw": None}
+        # Only an error that SAYS the block is absent is evidence of absence.
+        # Every other thing a node can answer - a rate limit, an RPC it will
+        # not serve, a hash it would not parse - says nothing about the block,
+        # and folding them all into the not-found reply told the caller "the
+        # node does not know block X" (404 block_not_found) when nothing had
+        # been read. That is the same "unknown reported as a fact" the
+        # non-object guard above exists to prevent; the 2026-10-11 note left it
+        # because telling the two apart was thought to need each endpoint's
+        # error strings. It needs one: `block_info` answers "Block not found",
+        # and the sibling repository nano-settlement-verify already splits on
+        # exactly that (`nano_claim.py`, `_Unknown` for everything else).
+        #
+        # The verdicts are not interchangeable to the caller. This is the read
+        # behind the endpoint an agent calls to prove its XNO settlement: a 404
+        # says the payment does not exist and there is nothing to retry, while
+        # an unreadable node is the 503 hold that says ask again. Holding is
+        # also the safe direction - it never turns an unpaid receipt into a
+        # settled one, only a false "you never paid" into "ask again".
+        if "not found" in str(answer["error"]).lower():
+            return {"found": False, "confirmed": False, "subtype": None,
+                    "destination": None, "amount_raw": None}
+        raise NodeError(
+            "the node answered an error (%s) rather than this block, so it was "
+            "not read and says nothing about this block" % _shown(answer["error"]))
     contents = answer.get("contents")
     if not isinstance(contents, dict):
         raise NodeError(
