@@ -2642,10 +2642,6 @@ class AVeryLongWholePart(unittest.TestCase):
                          "account can hold: %r" % (sent[:40] + "...",))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ANodeErrorThatIsNotANotFound(NodeStubs, unittest.TestCase):
     """A node that says anything but "not found" has not said the block is absent.
 
@@ -2667,7 +2663,11 @@ class ANodeErrorThatIsNotANotFound(NodeStubs, unittest.TestCase):
     """
 
     TRANSIENT = ("Too many requests", "RPC control is disabled",
-                 "Bad hash number", "Unable to parse JSON", "")
+                 "Bad hash number", "Unable to parse JSON", "",
+                 # Each contains "not found" but none is this node saying it
+                 # does not know this block, so none is evidence of absence.
+                 "Not Found", "Method not found", "Account not found",
+                 "Block not found on this endpoint", "Unknown block: not found")
 
     def test_a_transient_node_error_is_a_hold_not_a_not_found(self):
         for message in self.TRANSIENT:
@@ -2678,7 +2678,7 @@ class ANodeErrorThatIsNotANotFound(NodeStubs, unittest.TestCase):
 
     def test_block_not_found_is_still_a_not_found(self):
         """The one answer that IS evidence of absence keeps its verdict."""
-        for message in ("Block not found", "block not found", "Account not found"):
+        for message in ("Block not found", "block not found", " Block not found\n"):
             with self.subTest(error=message):
                 self.assertEqual(
                     node_module.normalise({"error": message}),
@@ -2693,8 +2693,78 @@ class ANodeErrorThatIsNotANotFound(NodeStubs, unittest.TestCase):
         self.assertEqual(answer["error"], "node_unavailable")
         self.assertIn("could not be read", answer["message"])
 
+    def test_a_non_string_error_is_a_hold(self):
+        for error in (None, 404, ["Block not found"], {"message": "Block not found"}):
+            with self.subTest(error=error):
+                with self.assertRaises(node_module.NodeError):
+                    node_module.normalise({"error": error})
+
+    def test_a_gateway_not_found_is_503_over_http_not_404(self):
+        node = self.serve_node(json.dumps({"error": "Not Found"}).encode("utf-8"))
+        status, answer = self.attach_over_http(node)
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(answer["error"], "node_unavailable")
+
     def test_a_genuine_not_found_is_still_404_over_http(self):
         node = self.serve_node(json.dumps({"error": "Block not found"}).encode("utf-8"))
         status, answer = self.attach_over_http(node)
         self.assertEqual(status, 404, answer)
         self.assertEqual(answer["error"], "block_not_found")
+
+
+class RefusalsMadeBeforeTheNodeIsAsked(Base):
+    """A refusal the ledger can make on its own does not wait on the node.
+
+    A malformed hash was passed to the node, whose "Bad hash number" was once
+    folded into a not-found, and `attach_block` then answered 400
+    bad_block_hash. Once a node error other than "Block not found" became the
+    503 hold, the same request was told to retry - and no retry can make a
+    malformed hash valid. The hash is now checked before the node is asked.
+    """
+
+    class RateLimitedNode(FakeNode):
+        def rpc(self, payload):
+            self.calls.append(payload)
+            return {"error": "Too many requests"}
+
+    def attach(self, block_hash):
+        return self.call("POST", "/v1/receipts/%s/attach-block" % self.receipt["id"],
+                         {"block_hash": block_hash}, token=TOKEN)
+
+    def setUp(self):
+        super().setUp()
+        self.receipt = self.create()
+
+    def test_a_malformed_hash_is_400_and_the_node_is_never_asked(self):
+        for node in (self.node, self.RateLimitedNode()):
+            self.application.node = node
+            for bad in (block().lower(), block()[:63], block() + "0", "", "G" * 64,
+                        None, 12, ["A" * 64]):
+                with self.subTest(node=type(node).__name__, block_hash=bad):
+                    with self.assertRaises(LedgerError) as caught:
+                        self.attach(bad)
+                    self.assertEqual(caught.exception.status, 400)
+                    self.assertEqual(caught.exception.code, "bad_block_hash")
+            self.assertEqual(node.calls, [])
+
+    def test_a_well_formed_hash_still_reaches_the_node(self):
+        """Control: the 503 hold for a rate-limited node is unchanged."""
+        node = self.application.node = self.RateLimitedNode()
+        with self.assertRaises(LedgerError) as caught:
+            self.attach(block())
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(caught.exception.code, "node_unavailable")
+        self.assertEqual(len(node.calls), 1)
+
+    def test_re_attaching_is_409_even_while_the_node_is_rate_limited(self):
+        self.settle(self.receipt)
+        node = self.application.node = self.RateLimitedNode()
+        with self.assertRaises(LedgerError) as caught:
+            self.attach(block("CAFE"))
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.code, "block_already_attached")
+        self.assertEqual(node.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

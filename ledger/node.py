@@ -14,6 +14,10 @@ import urllib.request
 # kilobytes; one mebibyte is generous and still bounded.
 MAX_REPLY_BYTES = 1024 * 1024
 
+# The node's block_info answer for a hash it does not know, compared after
+# stripping and lower-casing. It is the only error read as evidence of absence.
+BLOCK_NOT_FOUND = "block not found"
+
 
 class NodeError(Exception):
     """This client could not get an answer out of the node.
@@ -174,7 +178,12 @@ def normalise(answer):
         # an unreadable node is the 503 hold that says ask again. Holding is
         # also the safe direction - it never turns an unpaid receipt into a
         # settled one, only a false "you never paid" into "ask again".
-        if "not found" in str(answer["error"]).lower():
+        #
+        # The match is the whole string, not a substring: "Not Found" from a
+        # gateway, "Method not found" from an endpoint that does not serve
+        # block_info, or "Account not found" from some other RPC are not this
+        # node saying it does not know this block, so they are the hold too.
+        if isinstance(answer["error"], str) and answer["error"].strip().lower() == BLOCK_NOT_FOUND:
             return {"found": False, "confirmed": False, "subtype": None,
                     "destination": None, "amount_raw": None}
         raise NodeError(
