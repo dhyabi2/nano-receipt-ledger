@@ -2765,6 +2765,19 @@ class RefusalsMadeBeforeTheNodeIsAsked(Base):
         self.assertEqual(caught.exception.code, "block_already_attached")
         self.assertEqual(node.calls, [])
 
+    def test_a_reused_block_is_409_even_while_the_node_is_rate_limited(self):
+        used = block("BEEF")
+        first = self.create()
+        status, _ = self.settle(first, used)
+        self.assertEqual(status, 200)
+        node = self.application.node = self.RateLimitedNode()
+        with self.assertRaises(LedgerError) as caught:
+            self.attach(used)
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.code, "block_reused")
+        self.assertEqual(caught.exception.detail, {"receipt_id": first["id"]})
+        self.assertEqual(node.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

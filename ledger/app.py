@@ -153,7 +153,7 @@ class Application:
         if self.node is None:
             raise LedgerError(503, "no_node", "no Nano node is configured; nothing was attached")
         # Refusals the ledger can make without the node are made before asking
-        # it, in the order `attach_block` makes them (it still re-checks both
+        # it, in the order `attach_block` makes them (it still re-checks each
         # under the store lock). A malformed hash used to be passed to the node
         # first; the node's "Bad hash number" was folded into a not-found, and
         # `attach_block` then answered 400 bad_block_hash. Now that a node error
@@ -161,7 +161,8 @@ class Application:
         # told "retry" - and retrying a malformed hash can never succeed. A
         # receipt that already carries a block is likewise 409 whatever the
         # node says, so a rate-limited or unreachable node must not turn it
-        # into a 503.
+        # into a 503, and neither may a block that already settles another
+        # receipt, which is 409 block_reused.
         if not isinstance(block_hash, str) or not BLOCK_HASH_RE.match(block_hash):
             raise LedgerError(
                 400, "bad_block_hash", "'block_hash' must be 64 uppercase hex characters")
@@ -169,6 +170,16 @@ class Application:
             raise LedgerError(
                 409, "block_already_attached",
                 "receipt %s already carries block %s" % (params["receipt_id"], receipt["block_hash"]))
+        for other in self.store.receipts():
+            # A block that already settles another receipt is 409 block_reused
+            # whatever the node says, exactly as `attach_block` answers it.
+            if other["block_hash"] == block_hash:
+                raise LedgerError(
+                    409, "block_reused",
+                    "block %s is already the settlement of receipt %s; one block pays "
+                    "one receipt" % (block_hash, other["id"]),
+                    detail={"receipt_id": other["id"]},
+                )
         # A node that is CONFIGURED BUT DOWN is the same situation as the 503
         # one line above, and it used to get nothing at all: `NanoNode.rpc`
         # let the transport error out past `_dispatch`, which answers only

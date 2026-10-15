@@ -73,8 +73,8 @@ test asserting the old policy is replaced by one asserting the split, and the
 two stale comments calling the error field a known limitation now say it is
 closed.
 
-Suite after: **160 unit tests, 23/23 end-to-end.** The README's count law
-updated 151 → 160 in the same change.
+Suite after: **161 unit tests, 23/23 end-to-end.** The README's count law
+updated 151 → 161 in the same change.
 
 ### Two corrections to the above, from the review of this branch (2026-10-15)
 
@@ -92,8 +92,8 @@ regression this fix introduced:
    that ordering during this audit and judged it "one wasted node round trip,
    not worth a change" — without noticing that this very fix changed what the
    round trip returns. `_attach` now makes the refusals it can make without the
-   node (400 malformed hash, 409 already attached) before asking it, in
-   `attach_block`'s order.
+   node (400 malformed hash, 409 already attached, 409 block reused) before
+   asking it, in `attach_block`'s order.
 
 2. **The not-found match was a substring, so it was too loose.** `"not found" in
    error.lower()` also matched a gateway's `"Not Found"`, an endpoint's `"Method
