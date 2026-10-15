@@ -54,35 +54,69 @@ well: a test asserting the wrong thing.
 
 ## Fixed
 
-Only an error whose text says "not found" is read as a not-found; every other
-error raises `NodeError` and becomes the 503 hold. The node's own error text is
-echoed in the message, clipped to 200 characters so an endpoint cannot choose an
-unbounded one.
+Only `"Block not found"` — the whole string, case and surrounding space
+ignored — is read as a not-found; every other error, and a non-string error,
+raises `NodeError` and becomes the 503 hold. The node's own error text is
+echoed in the message, clipped to 200 characters so an endpoint cannot choose
+an unbounded one.
 
 This only narrows what the service will call a verdict. It cannot turn an
 unpaid receipt into a settled one — a hold writes nothing and `attach_block`
 still refuses everything it refused before. It converts a confident false "you
 never paid" into "ask again".
 
-Tests: `ANodeErrorThatIsNotANotFound`, 4 cases — the transient strings hold
-(5 subtests), `"Block not found"`/`"block not found"`/`"Account not found"`
-still read as not-found, a rate-limited read is 503 over the real HTTP server
-with nothing recorded, and a genuine not-found is still 404. 6 failures before
-the change, all passing after. The test asserting the old policy is replaced by
-one asserting the split, and the two stale comments calling the error field a
-known limitation now say it is closed.
+Tests: `ANodeErrorThatIsNotANotFound` — the transient strings hold,
+`"Block not found"`/`"block not found"` still read as not-found, a rate-limited
+read is 503 over the real HTTP server with nothing recorded, and a genuine
+not-found is still 404. 6 failures before the change, all passing after. The
+test asserting the old policy is replaced by one asserting the split, and the
+two stale comments calling the error field a known limitation now say it is
+closed.
 
-Suite after: **155 unit tests, 23/23 end-to-end.** The README's count law
-updated 151 → 155 in the same change.
+Suite after: **160 unit tests, 23/23 end-to-end.** The README's count law
+updated 151 → 160 in the same change.
+
+### Two corrections to the above, from the review of this branch (2026-10-15)
+
+The first version of this fix was wrong in two ways, both found by the
+independent review of pull request #13 and fixed in `2f60c36` on the same
+branch. Recorded here rather than quietly amended, because the second was a
+regression this fix introduced:
+
+1. **A malformed `block_hash` reached the node before `attach_block` validated
+   it, and this change turned that into a 503.** `_attach` passed any string
+   through to `block_info`; the node answers `"Bad hash number"`, which on
+   `main` folded into a not-found, so `attach_block`'s own `BLOCK_HASH_RE` check
+   then answered `400 bad_block_hash`. Once a non-not-found error became a hold,
+   that same request was told to **retry a hash that can never succeed**. I read
+   that ordering during this audit and judged it "one wasted node round trip,
+   not worth a change" — without noticing that this very fix changed what the
+   round trip returns. `_attach` now makes the refusals it can make without the
+   node (400 malformed hash, 409 already attached) before asking it, in
+   `attach_block`'s order.
+
+2. **The not-found match was a substring, so it was too loose.** `"not found" in
+   error.lower()` also matched a gateway's `"Not Found"`, an endpoint's `"Method
+   not found"` and `"Account not found"` — none of which is this node saying it
+   does not know this block. My own test asserted `"Account not found"` as a
+   not-found, and the section above cited the sibling repository's substring
+   rule as justification. That rule is right where `nano-settlement-verify` uses
+   it (`account_info`, `blocks_info`, where an account's absence is meaningful)
+   and wrong here: for `block_info` the only answer that is evidence of absence
+   is `"Block not found"`. Now matched whole.
+
+A third, cosmetic: the new test class was appended below
+`if __name__ == "__main__"`, so it ran under `unittest discover` (which CI and
+the README both use) but not under `python3 tests/test_ledger.py`. Moved
+above it.
 
 ## Could not verify
 
 - The real error strings of the public endpoints this would be pointed at. The
-  discriminator is Nano's own node wording (`"Block not found"`), matched
-  case-insensitively on the substring `"not found"`, which is the sibling
-  repository's rule. An endpoint that signals a genuine absence in some other
-  wording would now be a 503 hold rather than a 404 — the safe direction, and a
-  retry costs one more read.
+  discriminator is Nano's own node wording, `"Block not found"`, matched as
+  the whole string with case and surrounding space ignored. An endpoint that
+  signals a genuine absence in some other wording is a 503 hold rather than a
+  404 — the safe direction, and a retry costs one more read.
 - Nothing on this path was exercised against a live node; the node is a stub
   throughout the suite and the e2e script, by design (`ledger/core.py` is
   asserted to import no socket).
