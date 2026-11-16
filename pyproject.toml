@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-receipt-ledger"
+version = "0.2.0"
+description = "A public, append-only record of outward Nano payments, each carrying the block hash that proves it."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/dhyabi2/nano-receipt-ledger"
+
+[project.scripts]
+nano-receipt-ledger = "nano_receipt_ledger.cli:main"
+
+[tool.setuptools]
+packages = ["nano_receipt_ledger"]

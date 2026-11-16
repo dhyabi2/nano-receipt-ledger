@@ -20,10 +20,19 @@ import urllib.error
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SURVEY = os.path.join(ROOT, "survey")
-sys.path.insert(0, SURVEY)
 
-import build_readme  # noqa: E402
-import rederive  # noqa: E402
+
+def _script(name):
+    """Load a survey script by path: they are scripts, not part of the package."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, os.path.join(SURVEY, name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+build_readme = _script("build_readme")
+rederive = _script("rederive")
 
 
 def load(name):

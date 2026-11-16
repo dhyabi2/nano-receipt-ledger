@@ -11,9 +11,9 @@ says happened.
 import re
 import secrets
 
-import nanoaddr
-from errors import LedgerError
-from money import MAX_RAW, AmountError, format_xno, parse_xno
+from . import nanoaddr
+from .errors import LedgerError
+from .money import MAX_RAW, AmountError, format_xno, parse_xno
 
 KINDS = ("grant", "work_settlement", "tip", "refund")
 BLOCK_HASH_RE = re.compile(r"\A[0-9A-F]{64}\Z")
