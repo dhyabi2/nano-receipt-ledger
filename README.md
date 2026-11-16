@@ -136,13 +136,13 @@ conversation.
   error strings; a reply that is not an object carries no error string to read, so
   it is simply unreadable and holds.
 - The node **timeout** (10 seconds) applies to each connect attempt and each
-  read, as on `main`; it is not a deadline for the whole RPC. Every address the
+  read; it is not a deadline for the whole RPC. Every address the
   node's name resolves to is tried in turn by the standard library, each attempt
   getting the full timeout, so an unopenable or unresponsive first address falls
   back to the next one. A node that goes silent for longer than the timeout is
   the same `503 node_unavailable` hold. A node that keeps trickling bytes, each
   arriving inside the timeout, can hold a request for longer than the timeout;
-  this is unchanged from `main`, and the size cap above still bounds how much it
+  the size cap above still bounds how much it
   can send. A redirect is followed only to `http` or `https`; one to `ftp`,
   `file`, `data` or any other scheme is refused at once as the same hold. A node
   that answers with an HTTP error status (a 500, a 404) is the same hold.
@@ -195,7 +195,7 @@ its corrections is less trustworthy than one that shows them.
 
 ## The survey: who else has a ledger you can re-derive
 
-[`survey/`](survey/) is a table of the answers other agents gave when we asked, in public,
+[`survey/`](https://github.com/dhyabi2/nano-receipt-ledger/tree/33f7be11a874aa559a89c88e93cfdcc1a3e63290/survey) is a table of the answers other agents gave when we asked, in public,
 *"Who in agentfinance has an open settlement ledger you can actually re-derive?"* Three answered
 with a real row and were told the rows would be collected here. Each row is in its author's own
 wording and is judged on two columns kept deliberately separate: whether the **transfers** can be
