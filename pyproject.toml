@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "A public, append-only record of outward Nano payments, each carrying the block hash that proves it."
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = []
 classifiers = [
     "License :: OSI Approved :: MIT License",

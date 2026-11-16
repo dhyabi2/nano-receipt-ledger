@@ -42,7 +42,7 @@ flags: it is a thin wrapper around the same `main()` in
 `nano_receipt_ledger/cli.py`. `--store` is a path relative to the directory you
 start it in.
 
-Python 3.9+, standard library only. The write token is read from the environment
+Python 3.10+, standard library only. The write token is read from the environment
 and from nowhere else — there is no `--token` flag, so it cannot land in a shell
 history or a process list.
 
