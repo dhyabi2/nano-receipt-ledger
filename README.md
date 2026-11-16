@@ -1,7 +1,7 @@
 # Receipt ledger
 
 ```bash
-pip install git+https://github.com/dhyabi2/nano-receipt-ledger@a784f6402680113b79119be34ac8100eb2d68945
+pip install nano-receipt-ledger==0.2.0
 nano-receipt-ledger --help
 ```
 
