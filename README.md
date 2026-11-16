@@ -223,8 +223,7 @@ stub, so the HTTP layer, the node client and the store are all exercised for rea
 Nothing leaves the loopback interface and no test touches the network. The unit
 suite also runs `tools/secret_guard.sh` against the tracked tree.
 
-`nano_receipt_ledger/nanoaddr.py` and `nano_receipt_ledger/money.py` come from `tools/nano_wallet` in
-[dhyabi2/swarm-decisions](https://github.com/dhyabi2/swarm-decisions), vendored so
-this service has no dependencies.
+`nano_receipt_ledger/nanoaddr.py` (address checksum) and `nano_receipt_ledger/money.py` (raw/XNO
+arithmetic) are vendored into the package, so this service has no dependencies.
 
 MIT licensed.
