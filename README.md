@@ -213,7 +213,7 @@ Run these from the root of a checkout (the tests import `nano_receipt_ledger`
 from there, or from an installed copy):
 
 ```bash
-python3 -m unittest discover -s tests -v   # 156 unit tests
+python3 -m unittest discover -s tests -v   # 166 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
 bash -e tools/secret_guard.sh              # no token, seed or key is committed
 ```
