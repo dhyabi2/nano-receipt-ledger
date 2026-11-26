@@ -12,22 +12,20 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 import urllib.request
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "ledger"))
+from nano_receipt_ledger import app as app_module
+from nano_receipt_ledger import node as node_module
+from nano_receipt_ledger.app import (Application, MAX_TIMEOUT_SECONDS, ROUTES,
+                                     make_server, tokens_match)
+from nano_receipt_ledger.core import Ledger
+from nano_receipt_ledger.errors import LedgerError
+from nano_receipt_ledger.money import AmountError, format_xno, parse_xno
+from nano_receipt_ledger.store import Store
 
-import app as app_module  # noqa: E402
-import node as node_module  # noqa: E402
-from app import (Application, MAX_TIMEOUT_SECONDS, ROUTES,  # noqa: E402
-                 make_server, tokens_match)
-from core import Ledger  # noqa: E402
-from errors import LedgerError  # noqa: E402
-from money import AmountError, format_xno, parse_xno  # noqa: E402
-from store import Store  # noqa: E402
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 TOKEN = "test-token-not-a-real-one"
 SELLER = "nano_11131a3ia3a81w61k4id3i8iw5ri46b3871o4rdji8at5eg3t9izij86w3hz"
@@ -303,14 +301,19 @@ class SpecTests(Base):
 
     def test_11_ledger_cannot_move_money(self):
         # static: the core module imports nothing that could sign or send
-        with open(os.path.join(ROOT, "ledger", "core.py"), encoding="utf-8") as handle:
+        with open(os.path.join(ROOT, "nano_receipt_ledger", "core.py"), encoding="utf-8") as handle:
             tree = ast.parse(handle.read())
         imported = set()
         for statement in ast.walk(tree):
             if isinstance(statement, ast.Import):
                 imported.update(alias.name.split(".")[0] for alias in statement.names)
-            elif isinstance(statement, ast.ImportFrom) and statement.module:
-                imported.add(statement.module.split(".")[0])
+            elif isinstance(statement, ast.ImportFrom):
+                # `from .errors import X` names errors; `from . import nanoaddr`
+                # names nanoaddr. Either way the sibling module is what is imported.
+                if statement.module:
+                    imported.add(statement.module.split(".")[0])
+                else:
+                    imported.update(alias.name.split(".")[0] for alias in statement.names)
         self.assertEqual(imported, {"re", "secrets", "nanoaddr", "errors", "money"})
         for forbidden in ("urllib", "http", "socket", "requests", "node",
                           "ed25519_blake2b", "wallet", "subprocess", "os"):
@@ -887,7 +890,7 @@ class RepliesThatStillDroppedTheConnection(NodeStubs, unittest.TestCase):
         self.assertLess(len(answer["detail"]["amount"]["got"]), 200)
 
     def test_raw_amount_never_raises_on_a_long_or_oversized_amount(self):
-        from core import raw_amount
+        from nano_receipt_ledger.core import raw_amount
         for value in ("9" * 5000, "1" + "0" * 39, str(2 ** 128), 10 ** 40):
             with self.subTest(value=str(value)[:20]):
                 self.assertIsNone(raw_amount(value))
@@ -998,7 +1001,7 @@ class NodeValuesEchoedIntoARefusal(NodeStubs, unittest.TestCase):
         self.assert_answered("subtype", 5000)
 
     def test_echoed_node_values_are_short_strings(self):
-        from core import _shown_value
+        from nano_receipt_ledger.core import _shown_value
         self.assertIsNone(_shown_value(None))
         self.assertEqual(_shown_value("receive"), "receive")
         self.assertLess(len(_shown_value("x" * 100000)), 200)
@@ -1224,6 +1227,37 @@ class AReplyThatIsNotHTTP(NodeStubs, unittest.TestCase):
                               + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
         self.assertTrue(node.block_info(block())["confirmed"])
 
+    def test_a_body_cut_short_of_its_content_length_is_held(self):
+        # The body sent is a complete, valid, matching block_info answer; only
+        # the Content-Length says more was coming before the node hung up.
+        # `read(amt)` returned those short bytes without complaint, so the
+        # truncated reply was parsed and the receipt was recorded as paid.
+        body = self.reply()
+        self.assert_held(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n"
+                         % (len(body) + 1000) + body)
+
+    def test_a_body_one_byte_short_of_its_content_length_is_held(self):
+        body = self.reply()
+        self.assert_held(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n"
+                         % (len(body) + 1) + body)
+
+    def test_a_body_that_matches_its_content_length_is_still_read(self):
+        body = self.reply()
+        node = self.serve_raw(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n"
+                              % len(body) + body)
+        self.assertTrue(node.block_info(block())["confirmed"])
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertEqual(status, 200, answer)
+        self.assertTrue(stored["confirmed"])
+
+    def test_a_chunked_reply_is_read_over_http_too(self):
+        body = self.reply()
+        node = self.serve_raw(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                              + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertEqual(status, 200, answer)
+        self.assertTrue(stored["confirmed"])
+
 
 class AmountXnoAtTheDoor(Base):
     """`parse_xno` edge cases: the 128-bit ceiling, script digits, padding."""
@@ -1232,7 +1266,7 @@ class AmountXnoAtTheDoor(Base):
         self.assertEqual(parse_xno("340282366.920938"), 340282366920938 * 10 ** 24)
 
     def test_one_step_past_the_ceiling_is_refused(self):
-        from money import AmountError
+        from nano_receipt_ledger.money import AmountError
         with self.assertRaises(AmountError):
             parse_xno("340282366.920939")
 
@@ -1713,7 +1747,7 @@ class TimeoutsOutOfRange(unittest.TestCase):
 
 
 GUARD_STEP = "No token, seed or key may be committed"
-WORKFLOW = os.path.join(ROOT, ".github", "workflows", "test.yml")
+GUARD = os.path.join(ROOT, "tools", "secret_guard.sh")
 
 # Every fixture below joins this to its value at runtime. Spelling the
 # assignment out in one piece would plant a literal in a tracked file, which is
@@ -1722,33 +1756,17 @@ TOKEN_VAR = "RECEIPT_LEDGER_TOKEN"
 
 
 def guard_script():
-    """CI's secret-guard step, lifted out of the workflow rather than restated.
+    """The secret guard, read from tools/secret_guard.sh rather than restated.
 
-    Reading it from the workflow is the point: the suite then checks the guard
-    CI actually runs, so the two cannot drift into disagreeing about what
-    counts as a committed secret.
+    It was CI's secret-guard step until the GitHub Actions workflow was removed;
+    it now lives in that script, unchanged. Reading it from the script is the
+    point: the suite checks the guard a person actually runs, so the two cannot
+    drift into disagreeing about what counts as a committed secret.
     """
-    with open(WORKFLOW) as fh:
-        lines = fh.read().splitlines()
-
-    start = next((i for i, line in enumerate(lines) if GUARD_STEP in line), None)
-    assert start is not None, "the workflow no longer has a step named %r" % GUARD_STEP
-    run = next((j for j in range(start + 1, len(lines))
-                if lines[j].strip().startswith("run:")), None)
-    assert run is not None, "the %r step has no run: block" % GUARD_STEP
-
-    body, indent = [], None
-    for line in lines[run + 1:]:
-        if not line.strip():
-            body.append("")
-            continue
-        here = len(line) - len(line.lstrip())
-        if indent is None:
-            indent = here
-        if here < indent:
-            break
-        body.append(line[indent:])
-    return "\n".join(body)
+    with open(GUARD, encoding="utf-8") as fh:
+        text = fh.read()
+    assert GUARD_STEP in text, "tools/secret_guard.sh no longer says %r" % GUARD_STEP
+    return text
 
 
 class SecretGuard(unittest.TestCase):
@@ -1774,7 +1792,7 @@ class SecretGuard(unittest.TestCase):
             return self.run_guard(d)
 
     def test_the_guard_passes_on_the_tracked_tree(self):
-        """What CI checks out is the tracked files, so that is what gets scanned."""
+        """What a clone checks out is the tracked files, so that is what gets scanned."""
         try:
             listed = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT,
                                     capture_output=True)
@@ -1794,7 +1812,7 @@ class SecretGuard(unittest.TestCase):
             result = self.run_guard(d)
 
         self.assertEqual(result.returncode, 0,
-                         "CI's secret guard rejects this tree:\n"
+                         "the secret guard rejects this tree:\n"
                          + result.stdout + result.stderr)
 
     def test_a_literal_token_is_still_refused(self):
@@ -1948,7 +1966,7 @@ class ReadmeCounts(unittest.TestCase):
     but this repository's whole argument is that its claims can be checked
     rather than believed, and the first two numbers a reader can check were
     wrong. Counting the suites here instead of restating a number is the same
-    move `guard_script` makes with the workflow: the two cannot drift into
+    move `guard_script` makes with tools/secret_guard.sh: the two cannot drift into
     disagreeing, because only one of them is written down.
     """
 
@@ -2028,7 +2046,7 @@ class AWrongDestinationIsShownWhole(Base):
         self.assertEqual(self.refusal(OTHER_XRB)["got"], OTHER_XRB)
 
     def test_a_long_junk_destination_is_still_clipped(self):
-        from core import MAX_SHOWN, _shown_value
+        from nano_receipt_ledger.core import MAX_SHOWN, _shown_value
         self.assertEqual(_shown_value("a" * MAX_SHOWN), "a" * MAX_SHOWN)
         self.assertNotEqual(_shown_value("a" * (MAX_SHOWN + 1)), "a" * (MAX_SHOWN + 1))
         shown = self.refusal("nano_" + "1" * 5000)["got"]
@@ -2305,7 +2323,7 @@ class ARedirectOrATLSReply(ScriptedNode, unittest.TestCase):
 
 class TheEchoLimitAndItsClip(unittest.TestCase):
     def test_128_characters_are_shown_whole_and_129_are_clipped(self):
-        from core import MAX_SHOWN, _shown_value
+        from nano_receipt_ledger.core import MAX_SHOWN, _shown_value
         self.assertEqual(MAX_SHOWN, 128)
         self.assertEqual(_shown_value("a" * 128), "a" * 128)
         self.assertEqual(_shown_value("a" * 128 + "b"), "a" * 128 + "... (129 characters)")
@@ -2406,7 +2424,7 @@ class TheLinkedDepthLimit(Base):
         return {"k": value}
 
     def assert_limit(self, build):
-        from core import MAX_LINKED_DEPTH
+        from nano_receipt_ledger.core import MAX_LINKED_DEPTH
         self.assertEqual(MAX_LINKED_DEPTH, 16)
         status, receipt = self.create_linked(build(16))
         self.assertEqual(status, 201, receipt)
@@ -2667,7 +2685,9 @@ class ANodeErrorThatIsNotANotFound(NodeStubs, unittest.TestCase):
                  # Each contains "not found" but none is this node saying it
                  # does not know this block, so none is evidence of absence.
                  "Not Found", "Method not found", "Account not found",
-                 "Block not found on this endpoint", "Unknown block: not found")
+                 "Block not found on this endpoint", "Unknown block: not found",
+                 # The Kelvin sign lower-cases to "k": a look-alike, not the answer.
+                 "Bloc\u212a not found")
 
     def test_a_transient_node_error_is_a_hold_not_a_not_found(self):
         for message in self.TRANSIENT:
@@ -2777,6 +2797,48 @@ class RefusalsMadeBeforeTheNodeIsAsked(Base):
         self.assertEqual(caught.exception.code, "block_reused")
         self.assertEqual(caught.exception.detail, {"receipt_id": first["id"]})
         self.assertEqual(node.calls, [])
+
+
+
+class TheNodeIsToldWhoIsAsking(NodeStubs, unittest.TestCase):
+    """Every node request names this client in its User-Agent.
+
+    Without one, urllib sends `Python-urllib/3.x`, and rpc.nano.to answers
+    that with 403: serve.py could not use the public node at all, and every
+    attach was a 503 hold for a reason the reply never named.
+    """
+
+    def test_a_block_info_request_carries_this_clients_user_agent(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        seen = []
+        body = self.reply()
+
+        class Stub(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.headers.get("User-Agent"))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        stub = HTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        self.addCleanup(stub.server_close)
+        self.addCleanup(stub.shutdown)
+        node = node_module.NanoNode("http://127.0.0.1:%d" % stub.server_address[1], timeout=10)
+        self.assertTrue(node.block_info(block())["confirmed"])
+        status, answer, stored = self.attach_and_read_back(node)
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(len(seen), 2)
+        for agent in seen:
+            self.assertEqual(agent, node_module.USER_AGENT)
+            self.assertTrue(agent.startswith("nano-receipt-ledger/"), agent)
 
 
 if __name__ == "__main__":

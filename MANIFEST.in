@@ -1,0 +1,6 @@
+graft survey
+graft tests
+graft tools
+include serve.py e2e_check.py
+global-exclude *.py[cod]
+prune tests/__pycache__

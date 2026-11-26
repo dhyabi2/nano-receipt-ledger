@@ -14,8 +14,14 @@ import urllib.request
 # kilobytes; one mebibyte is generous and still bounded.
 MAX_REPLY_BYTES = 1024 * 1024
 
+# Sent on every node request. Without it urllib sends `Python-urllib/3.x`,
+# and rpc.nano.to answers that with 403, so serve.py could not use the
+# public node at all: every attach was a 503 hold.
+USER_AGENT = "nano-receipt-ledger/1 (+https://github.com/dhyabi2/nano-receipt-ledger)"
+
 # The node's block_info answer for a hash it does not know, compared after
-# stripping and lower-casing. It is the only error read as evidence of absence.
+# stripping and lower-casing, ASCII only. It is the only error read as
+# evidence of absence.
 BLOCK_NOT_FOUND = "block not found"
 
 
@@ -65,7 +71,7 @@ class NanoNode:
         request = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
             method="POST",
         )
         # A node on the far end of a socket fails in ways `normalise` below
@@ -98,6 +104,17 @@ class NanoNode:
         try:
             with _opener().open(request, timeout=self.timeout) as response:
                 body = response.read(MAX_REPLY_BYTES + 1)
+                # `read(amt)` does not raise IncompleteRead when the node
+                # hangs up before its Content-Length: it returns the short
+                # bytes, and a short body that happens to be complete JSON
+                # would be taken as the answer. `length` is what is still
+                # owed; any left after a read that stopped under the limit
+                # means the body was cut short. A chunked reply has no
+                # `length` (None) and reports its own truncation.
+                expected = response.length
+                if (len(body) <= MAX_REPLY_BYTES and isinstance(expected, int)
+                        and expected > 0):
+                    raise http.client.IncompleteRead(body, expected)
             if len(body) > MAX_REPLY_BYTES:
                 raise NodeError(
                     "%s answered %s with more than %d bytes; a block_info reply is "
@@ -183,7 +200,10 @@ def normalise(answer):
         # gateway, "Method not found" from an endpoint that does not serve
         # block_info, or "Account not found" from some other RPC are not this
         # node saying it does not know this block, so they are the hold too.
-        if isinstance(answer["error"], str) and answer["error"].strip().lower() == BLOCK_NOT_FOUND:
+        # The compare ignores case and surrounding space only; a non-ASCII
+        # look-alike (the Kelvin sign lower-cases to "k") is not this answer.
+        error = answer["error"]
+        if isinstance(error, str) and error.isascii() and error.strip().lower() == BLOCK_NOT_FOUND:
             return {"found": False, "confirmed": False, "subtype": None,
                     "destination": None, "amount_raw": None}
         raise NodeError(

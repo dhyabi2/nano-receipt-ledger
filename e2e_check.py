@@ -21,9 +21,9 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from nano_receipt_ledger.money import format_xno
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(ROOT, "ledger"))
-from money import format_xno  # noqa: E402
 
 TOKEN = "e2e-token-generated-for-this-run-only"
 SELLER = "nano_11131a3ia3a81w61k4id3i8iw5ri46b3871o4rdji8at5eg3t9izij86w3hz"

@@ -1,5 +1,14 @@
 # Receipt ledger
 
+```bash
+pip install nano-receipt-ledger==0.2.0
+nano-receipt-ledger --help
+```
+
+That installs the `nano-receipt-ledger` command (and the `nano_receipt_ledger`
+package, so `python3 -m nano_receipt_ledger` does the same). There are no
+dependencies. How to start it for real is under [Run it](#run-it).
+
 A public, append-only record of every payment we have made outward, each one
 carrying the Nano block hash that proves it. Reads need no authentication of any
 kind, ever.
@@ -14,7 +23,7 @@ checkable things instead:
   Verifiable by anyone, against the public Nano ledger. That is this service.
 
 It reads its facts from a Nano node, not from its own database, so it cannot
-flatter us. And it cannot move money: `ledger/core.py` imports `re`, `secrets`,
+flatter us. And it cannot move money: `nano_receipt_ledger/core.py` imports `re`, `secrets`,
 `nanoaddr`, `errors` and `money`, and nothing else — no socket, no signer, no
 wallet. A test asserts that import list and fails if it ever grows.
 
@@ -22,11 +31,16 @@ wallet. A test asserts that import list and fails if it ever grows.
 
 ```bash
 RECEIPT_LEDGER_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')" \
-  python3 serve.py --port 8080 \
-                   --store data/ledger.json \
-                   --node http://127.0.0.1:7076 \
-                   --base-url https://receipts.example.org
+  nano-receipt-ledger --port 8080 \
+                      --store data/ledger.json \
+                      --node http://127.0.0.1:7076 \
+                      --base-url https://receipts.example.org
 ```
+
+From a checkout, without installing, `python3 serve.py` takes exactly the same
+flags: it is a thin wrapper around the same `main()` in
+`nano_receipt_ledger/cli.py`. `--store` is a path relative to the directory you
+start it in.
 
 Python 3.10+, standard library only. The write token is read from the environment
 and from nowhere else — there is no `--token` flag, so it cannot land in a shell
@@ -122,13 +136,13 @@ conversation.
   error strings; a reply that is not an object carries no error string to read, so
   it is simply unreadable and holds.
 - The node **timeout** (10 seconds) applies to each connect attempt and each
-  read, as on `main`; it is not a deadline for the whole RPC. Every address the
+  read; it is not a deadline for the whole RPC. Every address the
   node's name resolves to is tried in turn by the standard library, each attempt
   getting the full timeout, so an unopenable or unresponsive first address falls
   back to the next one. A node that goes silent for longer than the timeout is
   the same `503 node_unavailable` hold. A node that keeps trickling bytes, each
   arriving inside the timeout, can hold a request for longer than the timeout;
-  this is unchanged from `main`, and the size cap above still bounds how much it
+  the size cap above still bounds how much it
   can send. A redirect is followed only to `http` or `https`; one to `ftp`,
   `file`, `data` or any other scheme is refused at once as the same hold. A node
   that answers with an HTTP error status (a 500, a 404) is the same hold.
@@ -149,7 +163,8 @@ conversation.
   `sendall` counts its timeout across the whole send), so a caller that reads the
   response too slowly is cut off. The server speaks HTTP/1.0: every connection
   carries one request and is closed after its response. Both values can be changed
-  with `serve.py --request-timeout SECONDS --request-deadline SECONDS`; each must
+  with `nano-receipt-ledger --request-timeout SECONDS --request-deadline SECONDS`
+  (or the same flags to `serve.py`); each must
   be a finite number of seconds above zero and at most 1000000000 (larger values
   overflow `socket.settimeout`), and anything else is refused at startup.
 - A node value echoed into a `409 block_mismatch` detail (`subtype`,
@@ -180,7 +195,7 @@ its corrections is less trustworthy than one that shows them.
 
 ## The survey: who else has a ledger you can re-derive
 
-[`survey/`](survey/) is a table of the answers other agents gave when we asked, in public,
+[`survey/`](https://github.com/dhyabi2/nano-receipt-ledger/tree/33f7be11a874aa559a89c88e93cfdcc1a3e63290/survey) is a table of the answers other agents gave when we asked, in public,
 *"Who in agentfinance has an open settlement ledger you can actually re-derive?"* Three answered
 with a real row and were told the rows would be collected here. Each row is in its author's own
 wording and is judged on two columns kept deliberately separate: whether the **transfers** can be
@@ -194,17 +209,21 @@ from `survey/rows.json` and a test fails if the committed file is not what a reb
 
 ## Tests
 
+Run these from the root of a checkout (the tests import `nano_receipt_ledger`
+from there, or from an installed copy):
+
 ```bash
-python3 -m unittest discover -s tests -v   # 161 unit tests
+python3 -m unittest discover -s tests -v   # 166 unit tests
 python3 e2e_check.py                       # 23 end-to-end checks
+bash -e tools/secret_guard.sh              # no token, seed or key is committed
 ```
 
 The end-to-end run starts `serve.py` as a subprocess against a loopback Nano node
 stub, so the HTTP layer, the node client and the store are all exercised for real.
-Nothing leaves the loopback interface and no test touches the network.
+Nothing leaves the loopback interface and no test touches the network. The unit
+suite also runs `tools/secret_guard.sh` against the tracked tree.
 
-`ledger/nanoaddr.py` and `ledger/money.py` come from `tools/nano_wallet` in
-[dhyabi2/swarm-decisions](https://github.com/dhyabi2/swarm-decisions), vendored so
-this service has no dependencies.
+`nano_receipt_ledger/nanoaddr.py` (address checksum) and `nano_receipt_ledger/money.py` (raw/XNO
+arithmetic) are vendored into the package, so this service has no dependencies.
 
 MIT licensed.
